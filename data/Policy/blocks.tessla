@@ -1,0 +1,28 @@
+in x: Events[Int]
+in y: Events[Int]
+
+def s1 = {
+  def a = constIf("a", x > 5)
+  def b = foo("b", y > 3)
+  if true then merge(a,b) else merge(a,b)
+}
+
+def s2 = {
+  def a = constIf("a", x > 5)
+  def b = foo("b", y > 3)
+  return merge(a,b)
+}
+
+def s3 = {
+  def a = constIf("a", x > 5)
+  def b = foo("b", y > 3)
+  merge(a,b)
+}
+
+out s1
+out s2
+out s3
+
+def foo[T](x: T, cond: Events[Bool]): Events[T] = lift(cond, nil[Unit], (c: Option[Bool], nix: Option[Unit]) =>
+    if getSome(c) then Some(x) else None[T]
+)

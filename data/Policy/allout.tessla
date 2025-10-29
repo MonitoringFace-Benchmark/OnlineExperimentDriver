@@ -1,0 +1,21 @@
+in a: Events[Int]
+in b: Events[Int]
+
+def div := a / b
+def mult := a * b
+def add := a + b
+def sub := a - b
+def diff := if (a < b) then b - a else a - b
+def add2 := add
+
+liftable def inc(x: Int) := {
+  def y := 1+x
+  y
+}
+
+def inca := inc(a)
+def incb := inc(b)
+
+out defined(a)
+out *
+out a * b

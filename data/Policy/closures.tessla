@@ -1,0 +1,26 @@
+def add(x: Int) := {
+  def addX(y: Int) := x+y
+  addX
+}
+
+def add1 := add(1)
+
+def add2 := add(2)
+
+out add1(1)
+out add2(1)
+out add1(2)
+out add2(2)
+
+def addStream(x: Int) := {
+  def addX(y: Events[Int]) := x+y
+  addX
+}
+
+in i: Events[Int]
+
+def add1Stream := addStream(1)
+def add2Stream := addStream(2)
+
+out add1Stream(i)
+out add2Stream(i)

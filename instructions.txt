@@ -1,0 +1,3 @@
+data/Trace/allout.input, data/Policy/allout.tessla
+data/Trace/blocks.input, data/Policy/blocks.tessla
+data/Trace/closures.input, data/Policy/closures.tessla
