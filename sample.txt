@@ -1,0 +1,10 @@
+C, tp=0, ts=0
+B, tp=0, ts=0, x1=4, x2=10
+A, tp=1, ts=1, x1=1
+A, tp=1, ts=1, x1=3
+A, tp=2, ts=2, x0=1
+A, tp=2, ts=2, x0=2
+A, tp=2, ts=2, x0=3
+B, tp=2, ts=2, x1=4, x2=10
+A, tp=3, ts=3, x1=999
+
