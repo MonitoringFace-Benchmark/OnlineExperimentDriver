@@ -287,7 +287,7 @@ fn run_with_source<S: DataSourcer<Item = String>>(
 
 fn main() {
     let cfg = Config::parse();
-    println!("Config: {cfg:#?}");
+    //println!("Config: {cfg:#?}");
 
     let binary_path = format!("{}/{}", cfg.binary_location.trim_end_matches('/'), cfg.binary_name);
     let extract_timestamp = resolve_timestamp_extractor(&cfg.format);
