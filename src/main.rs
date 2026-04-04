@@ -222,6 +222,7 @@ fn run_with_source<S: DataSourcer<Item = String>>(
     let mut accumulative_elapsed = 0.0_f64;
     let mut previous_timestamp: Option<usize> = None;
     let mut batch_index = 0usize;
+    let mut input_count = 0usize;
 
     if let Some(warm) = warm_up_input {
         let _ = send_line(&mut stdin, &mut stdout_lines, warm, &mut *collect_response);
@@ -234,7 +235,7 @@ fn run_with_source<S: DataSourcer<Item = String>>(
 
         while batch.len() < batch_size {
             match src.iterate() {
-                Some(next_input) => batch.push(next_input),
+                Some(next_input) => { input_count += 1; batch.push(next_input) },
                 None => break,
             }
         }
@@ -256,10 +257,11 @@ fn run_with_source<S: DataSourcer<Item = String>>(
         let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
         accumulative_elapsed += elapsed.as_secs_f64();
         println!("[Input  ] {}", joined_input);
-        let x = collect_response.read_until(&mut stdout_lines);
-        if x != "".to_string() {
-            println!("[Output ]\n{}", x);
+        let suppress_empty_output = collect_response.read_until(&mut stdout_lines);
+        if suppress_empty_output != "".to_string() {
+            println!("[Output ]\n{}", suppress_empty_output);
         }
+        println!("[Processed] {}", input_count);
         println!("[Elapsed] {} ns\n", elapsed_ns);
 
         if let Some(max_ms) = maximum_latency_ms {
