@@ -235,7 +235,7 @@ fn run_with_source<S: DataSourcer<Item = String>>(
 
         while batch.len() < batch_size {
             match src.iterate() {
-                Some(next_input) => { input_count += 1; batch.push(next_input) },
+                Some(next_input) => { batch.push(next_input) },
                 None => break,
             }
         }
@@ -248,6 +248,7 @@ fn run_with_source<S: DataSourcer<Item = String>>(
         if let Err(e) = stdin.write_all(to_write.as_bytes()) {
             exit_with_code(1, &format!("Fatal: failed to write to persistent child stdin: {}", e));
         }
+        input_count += batch.len();
         if let Err(e) = stdin.flush() {
             exit_with_code(1, &format!("Fatal: failed to flush persistent child stdin: {}", e));
         }
