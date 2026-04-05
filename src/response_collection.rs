@@ -31,8 +31,8 @@ fn read_lines_until(
 
                 result.push(line);
             }
-            Some(Err(e)) => exit_with_code(1, &format!("Fatal: error reading response from persistent child: {}", e)),
-            None => exit_with_code(1, "Fatal: persistent child stdout closed unexpectedly"),
+            Some(Err(e)) => exit_with_code(1, &format!("[ERROR] error reading response from persistent child: {}", e)),
+            None => exit_with_code(1, "[ERROR] persistent child stdout closed unexpectedly"),
         }
     }
 
@@ -50,8 +50,8 @@ fn consume_lines_until(
 
                 if contains_delimiter(&line, delimiter) { return; }
             }
-            Some(Err(e)) => exit_with_code(1, &format!("Fatal: error reading response from persistent child: {}", e)),
-            None => exit_with_code(1, "Fatal: persistent child stdout closed unexpectedly"),
+            Some(Err(e)) => exit_with_code(1, &format!("[ERROR] error reading response from persistent child: {}", e)),
+            None => exit_with_code(1, "[ERROR] persistent child stdout closed unexpectedly"),
         }
     }
 }
@@ -112,6 +112,6 @@ pub fn resolve_response_collector(mode: Option<&str>) -> Box<dyn ResponseCollect
     match mode.unwrap_or("event-count") {
         "event-count" => Box::new(EventCountResponseCollection::new("event count")),
         "current-timepoint" => Box::new(CurrentTimepointCollection::new("Process step")),
-        _ => exit_with_code(1, &format!("Fatal: unknown response_mode: {}", mode.unwrap_or("event-count"))),
+        _ => exit_with_code(1, &format!("[ERROR] unknown response_mode: {}", mode.unwrap_or("event-count"))),
     }
 }

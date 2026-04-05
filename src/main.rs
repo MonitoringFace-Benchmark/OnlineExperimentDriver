@@ -97,7 +97,7 @@ fn timestamp_to_duration(value: usize, units: &str) -> Duration {
         "seconds" => Duration::from_secs(value as u64),
         "milliseconds" => Duration::from_millis(value as u64),
         "microseconds" => Duration::from_micros(value as u64),
-        _ => exit_with_code(1, &format!("Fatal: unknown timestamp_units: {}", units)),
+        _ => exit_with_code(1, &format!("[ERROR] unknown timestamp_units: {}", units)),
     }
 }
 
@@ -128,7 +128,7 @@ fn resolve_timestamp_extractor(format: &str) -> fn(&str) -> Option<usize> {
     match format {
         "csv" => extract_timestamp_csv::extract_ts,
         "log" => extract_timestamp_log::extract_ts,
-        _ => exit_with_code(1, &format!("Fatal: unknown format: {}", format)),
+        _ => exit_with_code(1, &format!("[ERROR] unknown format: {}", format)),
     }
 }
 
@@ -138,10 +138,10 @@ fn send_line(stdin: &mut dyn Write, stdout_lines: &mut dyn Iterator<Item = std::
         to_write.push('\n');
     }
     if let Err(e) = stdin.write_all(to_write.as_bytes()) {
-        exit_with_code(1, &format!("Fatal: failed to write to persistent child stdin: {}", e));
+        exit_with_code(1, &format!("[ERROR] failed to write to persistent child stdin: {}", e));
     }
     if let Err(e) = stdin.flush() {
-        exit_with_code(1, &format!("Fatal: failed to flush persistent child stdin: {}", e));
+        exit_with_code(1, &format!("[ERROR] failed to flush persistent child stdin: {}", e));
     }
 
     collect_response.consume_until(stdout_lines);
@@ -164,7 +164,7 @@ fn parse_input_aggregation(value: Option<&str>) -> Vec<usize> {
 
     let mut sizes = Vec::new();
     for part in trimmed.split(',') {
-        let parsed = part.trim().parse::<usize>().unwrap_or_else(|_| exit_with_code(1, &format!("Fatal: invalid input_aggregation value: {}", raw)));
+        let parsed = part.trim().parse::<usize>().unwrap_or_else(|_| exit_with_code(1, &format!("[ERROR] invalid input_aggregation value: {}", raw)));
         sizes.push(parsed.max(1));
     }
 
@@ -202,7 +202,7 @@ fn run_with_source<S: DataSourcer<Item = String>>(
     mut collect_response: Box<dyn ResponseCollection>,
 ) {
     if !src.start() {
-        exit_with_code(1, "Fatal: data source failed to start");
+        exit_with_code(1, "[ERROR] data source failed to start");
     }
 
     let mut child = match Command::new(binary_path)
@@ -213,11 +213,11 @@ fn run_with_source<S: DataSourcer<Item = String>>(
     {
         Ok(c) => c,
         Err(e) => {
-            exit_with_code(1, &format!("Fatal: failed to spawn persistent {}: {}", binary_path, e));
+            exit_with_code(1, &format!("[ERROR] failed to spawn persistent {}: {}", binary_path, e));
         }
     };
 
-    let mut stdin = child.stdin.take().expect("Child stdin not piped");
+    let mut stdin = child.stdin.take().expect("[ERROR] Child stdin not piped");
     let mut stdout_lines = std::io::BufReader::new(child.stdout.take().expect("Child stdout not piped")).lines();
     let mut accumulative_elapsed = 0.0_f64;
     let mut previous_timestamp: Option<usize> = None;
@@ -246,11 +246,11 @@ fn run_with_source<S: DataSourcer<Item = String>>(
 
         let start = Instant::now();
         if let Err(e) = stdin.write_all(to_write.as_bytes()) {
-            exit_with_code(1, &format!("Fatal: failed to write to persistent child stdin: {}", e));
+            exit_with_code(1, &format!("[ERROR] failed to write to persistent child stdin: {}", e));
         }
         input_count += batch.len();
         if let Err(e) = stdin.flush() {
-            exit_with_code(1, &format!("Fatal: failed to flush persistent child stdin: {}", e));
+            exit_with_code(1, &format!("[ERROR] failed to flush persistent child stdin: {}", e));
         }
 
         let elapsed = start.elapsed();
@@ -344,7 +344,7 @@ fn main() {
             );
         }
         _ => {
-            exit_with_code(1, &format!("Fatal: unknown data_source_type: {}", cfg.data_source_type));
+            exit_with_code(1, &format!("[ERROR] unknown data_source_type: {}", cfg.data_source_type));
         }
     }
 }
