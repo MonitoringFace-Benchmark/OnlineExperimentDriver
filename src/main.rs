@@ -267,7 +267,10 @@ fn run_with_source<S: DataSourcer<Item = String>>(
 
         if let Some(max_ms) = maximum_latency_ms {
             if elapsed_ms > max_ms {
-                exit_with_code(300, &format!(
+                println!("[Accumulative Elapsed] {:.6} s", accumulative_elapsed);
+                println!("[Total Count] {}", input_count);
+                println!("[Error] maximum latency exceeded");
+                exit_with_code(250, &format!(
                     "Fatal: maximum latency exceeded: {:.3} ms > {:.3} ms",
                     elapsed_ms, max_ms
                 ));
@@ -276,6 +279,9 @@ fn run_with_source<S: DataSourcer<Item = String>>(
 
         if let Some(max_accumulative_secs) = accumulative_time_secs {
             if accumulative_elapsed > max_accumulative_secs {
+                println!("[Accumulative Elapsed] {:.6} s", accumulative_elapsed);
+                println!("[Total Count] {}", input_count);
+                println!("[Error] accumulative latency exceeded");
                 exit_with_code(200, &format!(
                     "Fatal: accumulative latency exceeded: {:.6} s > {:.6} s",
                     accumulative_elapsed, max_accumulative_secs
@@ -283,6 +289,9 @@ fn run_with_source<S: DataSourcer<Item = String>>(
             }
         }
     }
+
+    println!("[Accumulative Elapsed] {:.6} s", accumulative_elapsed);
+    println!("[Total Count] {}", input_count);
 
     drop(stdin);
     let _ = child.wait();
