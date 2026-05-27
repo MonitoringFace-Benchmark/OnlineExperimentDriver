@@ -111,7 +111,7 @@ impl ResponseCollection for CurrentTimepointCollection {
 pub fn resolve_response_collector(mode: Option<&str>) -> Box<dyn ResponseCollection> {
     match mode.unwrap_or("event-count") {
         "event-count" => Box::new(EventCountResponseCollection::new("event count")),
-        "current-timepoint" => Box::new(CurrentTimepointCollection::new("Process step")),
+        "current-timepoint" => Box::new(CurrentTimepointCollection::new("At time point")),
         _ => exit_with_code(1, &format!("[ERROR] unknown response_mode: {}", mode.unwrap_or("event-count"))),
     }
 }
