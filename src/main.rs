@@ -50,6 +50,10 @@ struct Config {
     #[arg(long, value_parser = ["event-count", "current-timepoint"])]
     response_mode: Option<String>,
 
+    /// Output collection position relative to the response delimiter
+    #[arg(long, value_parser = ["before-delimiter", "after-delimiter"], default_value = "after-delimiter")]
+    output_collection_mode: String,
+
     /// Data source type: "file" or "script"
     #[arg(long)]
     data_source_type: String,
@@ -148,6 +152,36 @@ fn send_line(stdin: &mut dyn Write, stdout_lines: &mut dyn Iterator<Item = std::
     String::new()
 }
 
+fn read_until_delimiter(
+    collect_response: &mut dyn ResponseCollection,
+    stdout_lines: &mut dyn Iterator<Item = std::io::Result<String>>,
+) -> String {
+    collect_response.read_until(stdout_lines)
+}
+
+fn read_since_delimiter(
+    collect_response: &mut dyn ResponseCollection,
+    stdout_lines: &mut dyn Iterator<Item = std::io::Result<String>>,
+) -> String {
+    collect_response.read_since(stdout_lines)
+}
+
+fn resolve_output_reader(
+    output_collection_mode: &str,
+) -> fn(&mut dyn ResponseCollection, &mut dyn Iterator<Item = std::io::Result<String>>) -> String {
+    match output_collection_mode {
+        "before-delimiter" => read_until_delimiter,
+        "after-delimiter" => read_since_delimiter,
+        _ => exit_with_code(
+            1,
+            &format!(
+                "[ERROR] unknown output_collection_mode: {}",
+                output_collection_mode
+            ),
+        ),
+    }
+}
+
 fn parse_input_aggregation(value: Option<&str>) -> Vec<usize> {
     let Some(raw) = value else {
         return vec![1];
@@ -199,6 +233,7 @@ fn run_with_source<S: DataSourcer<Item = String>>(
     extract_timestamp: fn(&str) -> Option<usize>,
     batch_sizes: Vec<usize>,
     batch_delimiter: &str,
+    output_collection_mode: &str,
     mut collect_response: Box<dyn ResponseCollection>,
 ) {
     if !src.start() {
@@ -223,6 +258,7 @@ fn run_with_source<S: DataSourcer<Item = String>>(
     let mut previous_timestamp: Option<usize> = None;
     let mut batch_index = 0usize;
     let mut input_count = 0usize;
+    let output_reader = resolve_output_reader(output_collection_mode);
 
     if let Some(warm) = warm_up_input {
         let _ = send_line(&mut stdin, &mut stdout_lines, warm, &mut *collect_response);
@@ -258,8 +294,8 @@ fn run_with_source<S: DataSourcer<Item = String>>(
         let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
         accumulative_elapsed += elapsed.as_secs_f64();
         println!("[Input  ] {}", joined_input);
-        let suppress_empty_output = collect_response.read_until(&mut stdout_lines);
-        if suppress_empty_output != "".to_string() {
+        let suppress_empty_output = output_reader(&mut *collect_response, &mut stdout_lines);
+        if !suppress_empty_output.is_empty() {
             println!("[Output ]\n{}", suppress_empty_output);
         }
         println!("[Processed] {}", input_count);
@@ -323,6 +359,7 @@ fn main() {
                 extract_timestamp,
                 batch_sizes.clone(),
                 batch_delimiter,
+                &cfg.output_collection_mode,
                 collect_response
             );
         }
@@ -340,6 +377,7 @@ fn main() {
                 extract_timestamp,
                 batch_sizes,
                 batch_delimiter,
+                &cfg.output_collection_mode,
                 collect_response
             );
         }

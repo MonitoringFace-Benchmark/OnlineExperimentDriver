@@ -6,6 +6,11 @@ pub trait ResponseCollection {
         stdout_lines: &mut dyn Iterator<Item = std::io::Result<String>>,
     ) -> String;
 
+    fn read_since(
+        &mut self,
+        stdout_lines: &mut dyn Iterator<Item = std::io::Result<String>>,
+    ) -> String;
+
     fn consume_until(
         &mut self,
         stdout_lines: &mut dyn Iterator<Item = std::io::Result<String>>,
@@ -56,6 +61,32 @@ fn consume_lines_until(
     }
 }
 
+fn read_line_since(
+    stdout_lines: &mut dyn Iterator<Item = std::io::Result<String>>,
+    delimiter: &str,
+) -> String {
+    consume_lines_until(stdout_lines, delimiter);
+
+    loop {
+        match stdout_lines.next() {
+            Some(Ok(line)) => {
+                if line.trim().is_empty() {
+                    continue;
+                }
+
+                return line;
+            }
+            Some(Err(e)) => {
+                exit_with_code(
+                    1,
+                    &format!("[ERROR] error reading response from persistent child: {}", e),
+                )
+            }
+            None => exit_with_code(1, "[ERROR] persistent child stdout closed unexpectedly"),
+        }
+    }
+}
+
 pub struct EventCountResponseCollection {
     delimiter: String,
 }
@@ -72,6 +103,13 @@ impl ResponseCollection for EventCountResponseCollection {
         stdout_lines: &mut dyn Iterator<Item = std::io::Result<String>>,
     ) -> String {
         read_lines_until(stdout_lines, &self.delimiter)
+    }
+
+    fn read_since(
+        &mut self,
+        stdout_lines: &mut dyn Iterator<Item = std::io::Result<String>>,
+    ) -> String {
+        read_line_since(stdout_lines, &self.delimiter)
     }
 
     fn consume_until(
@@ -98,6 +136,13 @@ impl ResponseCollection for CurrentTimepointCollection {
         stdout_lines: &mut dyn Iterator<Item = std::io::Result<String>>,
     ) -> String {
         read_lines_until(stdout_lines, &self.delimiter)
+    }
+
+    fn read_since(
+        &mut self,
+        stdout_lines: &mut dyn Iterator<Item = std::io::Result<String>>,
+    ) -> String {
+        read_line_since(stdout_lines, &self.delimiter)
     }
 
     fn consume_until(
