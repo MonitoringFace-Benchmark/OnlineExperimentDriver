@@ -74,12 +74,22 @@ struct Config {
     #[arg(last = true)]
     binary_args: Vec<String>,
 
-    /// Input aggregation: a constant chunk size like `4` or a comma-separated list like `1,4,4,2`
+    /// Input aggregation number: a constant chunk size like `4` or a comma-separated list like `1,4,4,2`
     #[arg(long)]
-    input_aggregation: Option<String>,
+    input_aggregation_number: Option<String>,
 
+    /// Input aggregation pattern: a string pattern the last element of a batch starts with
+    #[arg(long)]
+    input_aggregation_pattern: Option<String>,
+
+    /// r: a pattern to concatenate inputs
     #[arg(long)]
     batch_delimiter: Option<String>,
+}
+
+enum BatchingMethod {
+    Numbers(Vec<usize>),
+    Pattern(String)
 }
 
 fn exit_with_code(code: i32, message: &str) -> ! {
@@ -220,6 +230,43 @@ fn next_batch_size(sizes: &[usize], batch_index: usize) -> usize {
     }
 }
 
+fn resolve_batcher<S: DataSourcer<Item = String>>(
+    batching_method: BatchingMethod,
+) -> Box<dyn FnMut(&mut S) -> Option<Vec<String>>> {
+    match batching_method {
+        BatchingMethod::Numbers(batch_sizes) => {
+            let mut batch_index = 0usize;
+            Box::new(move |src: &mut S| {
+                let mut batch = vec![src.iterate()?];
+
+                let batch_size = next_batch_size(&batch_sizes, batch_index);
+                batch_index += 1;
+
+                while batch.len() < batch_size {
+                    match src.iterate() {
+                        Some(next_input) => batch.push(next_input),
+                        None => break,
+                    }
+                }
+                Some(batch)
+            })
+        }
+        BatchingMethod::Pattern(pattern) => {
+            Box::new(move |src: &mut S| {
+                let mut batch = vec![src.iterate()?];
+                
+                while !batch.last().unwrap().starts_with(&pattern) {
+                    match src.iterate() {
+                        Some(next_input) => batch.push(next_input),
+                        None => break,
+                    }
+                }
+                Some(batch)
+            })
+        }
+    }
+}
+
 fn run_with_source<S: DataSourcer<Item = String>>(
     mut src: S,
     binary_path: &str,
@@ -231,7 +278,7 @@ fn run_with_source<S: DataSourcer<Item = String>>(
     mode: &str,
     timestamp_units: Option<&str>,
     extract_timestamp: fn(&str) -> Option<usize>,
-    batch_sizes: Vec<usize>,
+    batch_method: BatchingMethod,
     batch_delimiter: &str,
     output_collection_mode: &str,
     mut collect_response: Box<dyn ResponseCollection>,
@@ -256,26 +303,15 @@ fn run_with_source<S: DataSourcer<Item = String>>(
     let mut stdout_lines = std::io::BufReader::new(child.stdout.take().expect("Child stdout not piped")).lines();
     let mut accumulative_elapsed = 0.0_f64;
     let mut previous_timestamp: Option<usize> = None;
-    let mut batch_index = 0usize;
     let mut input_count = 0usize;
     let output_reader = resolve_output_reader(output_collection_mode);
+    let mut next_batch = resolve_batcher(batch_method);
 
     if let Some(warm) = warm_up_input {
         let _ = send_line(&mut stdin, &mut stdout_lines, warm, &mut *collect_response);
     }
 
-    while let Some(input) = src.iterate() {
-        let mut batch = vec![input];
-        let batch_size = next_batch_size(&batch_sizes, batch_index);
-        batch_index += 1;
-
-        while batch.len() < batch_size {
-            match src.iterate() {
-                Some(next_input) => { batch.push(next_input) },
-                None => break,
-            }
-        }
-
+    while let Some(batch) = next_batch(&mut src) {
         let joined_input = batch.join(batch_delimiter);
         let to_write = format_input_line(latency_marker, &joined_input);
         pace_before_send(mode, timestamp_units, &mut previous_timestamp, extract_timestamp(&batch[0]));
@@ -335,12 +371,17 @@ fn run_with_source<S: DataSourcer<Item = String>>(
 
 fn main() {
     let cfg = Config::parse();
-    //println!("Config: {cfg:#?}");
 
     let binary_path = format!("{}/{}", cfg.binary_location.trim_end_matches('/'), cfg.binary_name);
     let extract_timestamp = resolve_timestamp_extractor(&cfg.format);
     let collect_response = resolve_response_collector(cfg.response_mode.as_deref());
-    let batch_sizes = parse_input_aggregation(cfg.input_aggregation.as_deref());
+
+    let batch_method = if cfg.input_aggregation_pattern.is_some() {
+        BatchingMethod::Pattern(cfg.input_aggregation_pattern.unwrap())
+    } else {
+        BatchingMethod::Numbers(parse_input_aggregation(cfg.input_aggregation_number.as_deref()))
+    };
+
     let batch_delimiter_raw = cfg.batch_delimiter.unwrap_or("#".to_string());
     let batch_delimiter = batch_delimiter_raw.as_str();
 
@@ -357,7 +398,7 @@ fn main() {
                 &cfg.mode,
                 cfg.timestamp_units.as_deref(),
                 extract_timestamp,
-                batch_sizes.clone(),
+                batch_method,
                 batch_delimiter,
                 &cfg.output_collection_mode,
                 collect_response
@@ -375,7 +416,7 @@ fn main() {
                 &cfg.mode,
                 cfg.timestamp_units.as_deref(),
                 extract_timestamp,
-                batch_sizes,
+                batch_method,
                 batch_delimiter,
                 &cfg.output_collection_mode,
                 collect_response
