@@ -37,7 +37,9 @@ fn read_lines_until(
                 result.push(line);
             }
             Some(Err(e)) => exit_with_code(1, &format!("[ERROR] error reading response from persistent child: {}", e)),
-            None => exit_with_code(1, "[ERROR] persistent child stdout closed unexpectedly"),
+            // Stream ended (timeout or EOF); hand back what we have and let the
+            // caller decide (the driver checks for a timeout / dead child).
+            None => break,
         }
     }
 
@@ -56,7 +58,8 @@ fn consume_lines_until(
                 if contains_delimiter(&line, delimiter) { return; }
             }
             Some(Err(e)) => exit_with_code(1, &format!("[ERROR] error reading response from persistent child: {}", e)),
-            None => exit_with_code(1, "[ERROR] persistent child stdout closed unexpectedly"),
+            // Stream ended before the delimiter; let the caller handle it.
+            None => return,
         }
     }
 }
@@ -82,7 +85,8 @@ fn read_line_since(
                     &format!("[ERROR] error reading response from persistent child: {}", e),
                 )
             }
-            None => exit_with_code(1, "[ERROR] persistent child stdout closed unexpectedly"),
+            // Stream ended before a line arrived; let the caller handle it.
+            None => return String::new(),
         }
     }
 }

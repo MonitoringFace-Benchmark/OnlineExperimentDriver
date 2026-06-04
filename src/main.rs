@@ -4,7 +4,8 @@ mod response_collection;
 
 use clap::Parser;
 use std::io::{BufRead, Write};
-use std::process::{Command, Stdio};
+use std::process::{ChildStdout, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use crate::data_sources::data_file_source::DataFileSource;
@@ -219,6 +220,125 @@ fn parse_input_aggregation(value: Option<&str>) -> Vec<usize> {
     }
 }
 
+/// Which time budget produced a read deadline, so a timeout reports the right
+/// message and exit code.
+#[derive(Clone, Copy)]
+enum Budget {
+    PerStep,
+    Accumulative,
+}
+
+/// Owns the child's stdout on a background thread and forwards each line over a
+/// channel. This lets the main loop read responses with a wall-clock deadline
+/// (`recv_timeout`) instead of blocking forever on a hung monitor.
+struct OutputChannel {
+    rx: Receiver<std::io::Result<String>>,
+}
+
+impl OutputChannel {
+    fn spawn(stdout: ChildStdout) -> Self {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                // Stop once the main thread drops the receiver.
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+            // Dropping `tx` disconnects the channel, which the reader sees as EOF.
+        });
+        OutputChannel { rx }
+    }
+
+    /// View the incoming lines as an iterator bounded by `deadline`. On timeout
+    /// it sets `*timed_out` and ends iteration so the caller can react.
+    fn lines<'a>(&'a self, deadline: Option<Instant>, timed_out: &'a mut bool) -> DeadlineLines<'a> {
+        DeadlineLines { rx: &self.rx, deadline, timed_out }
+    }
+}
+
+struct DeadlineLines<'a> {
+    rx: &'a Receiver<std::io::Result<String>>,
+    deadline: Option<Instant>,
+    timed_out: &'a mut bool,
+}
+
+impl<'a> Iterator for DeadlineLines<'a> {
+    type Item = std::io::Result<String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.deadline {
+            None => self.rx.recv().ok(),
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match self.rx.recv_timeout(remaining) {
+                    Ok(item) => Some(item),
+                    Err(RecvTimeoutError::Timeout) => {
+                        *self.timed_out = true;
+                        None
+                    }
+                    Err(RecvTimeoutError::Disconnected) => None,
+                }
+            }
+        }
+    }
+}
+
+/// Deadline for a step's response read: the earlier of the per-step latency
+/// budget and the remaining accumulative budget. `None` when neither limit is
+/// configured, in which case the read blocks indefinitely (previous behavior).
+fn read_deadline(
+    start: Instant,
+    maximum_latency_ms: Option<f64>,
+    accumulative_time_secs: Option<f64>,
+    accumulative_elapsed: f64,
+) -> Option<(Instant, Budget)> {
+    let per_step = maximum_latency_ms
+        .map(|ms| (start + Duration::from_secs_f64(ms.max(0.0) / 1000.0), Budget::PerStep));
+    let accumulative = accumulative_time_secs.map(|secs| {
+        let remaining = (secs - accumulative_elapsed).max(0.0);
+        (start + Duration::from_secs_f64(remaining), Budget::Accumulative)
+    });
+
+    match (per_step, accumulative) {
+        (Some(p), Some(a)) => Some(if p.0 <= a.0 { p } else { a }),
+        (Some(p), None) => Some(p),
+        (None, Some(a)) => Some(a),
+        (None, None) => None,
+    }
+}
+
+/// Print the stats block and exit with the code for the exceeded budget.
+fn report_timeout(
+    budget: Budget,
+    elapsed: Duration,
+    accumulative_elapsed: f64,
+    input_count: usize,
+    maximum_latency_ms: Option<f64>,
+    accumulative_time_secs: Option<f64>,
+) -> ! {
+    println!("[Accumulative Elapsed] {:.6} s", accumulative_elapsed);
+    println!("[Total Count] {}", input_count);
+    match budget {
+        Budget::PerStep => {
+            println!("[Error] maximum latency exceeded");
+            exit_with_code(250, &format!(
+                "Fatal: maximum latency exceeded: {:.3} ms > {:.3} ms",
+                elapsed.as_secs_f64() * 1000.0,
+                maximum_latency_ms.unwrap_or(0.0)
+            ));
+        }
+        Budget::Accumulative => {
+            println!("[Error] accumulative latency exceeded");
+            exit_with_code(200, &format!(
+                "Fatal: accumulative latency exceeded: {:.6} s > {:.6} s",
+                accumulative_elapsed,
+                accumulative_time_secs.unwrap_or(0.0)
+            ));
+        }
+    }
+}
+
 fn next_batch_size(sizes: &[usize], batch_index: usize) -> usize {
     if sizes.is_empty() {
         return 1;
@@ -300,7 +420,7 @@ fn run_with_source<S: DataSourcer<Item = String>>(
     };
 
     let mut stdin = child.stdin.take().expect("[ERROR] Child stdin not piped");
-    let mut stdout_lines = std::io::BufReader::new(child.stdout.take().expect("Child stdout not piped")).lines();
+    let output = OutputChannel::spawn(child.stdout.take().expect("[ERROR] Child stdout not piped"));
     let mut accumulative_elapsed = 0.0_f64;
     let mut previous_timestamp: Option<usize> = None;
     let mut input_count = 0usize;
@@ -308,7 +428,9 @@ fn run_with_source<S: DataSourcer<Item = String>>(
     let mut next_batch = resolve_batcher(batch_method);
 
     if let Some(warm) = warm_up_input {
-        let _ = send_line(&mut stdin, &mut stdout_lines, warm, &mut *collect_response);
+        let mut warm_timed_out = false;
+        let mut lines = output.lines(None, &mut warm_timed_out);
+        let _ = send_line(&mut stdin, &mut lines, warm, &mut *collect_response);
     }
 
     while let Some(batch) = next_batch(&mut src) {
@@ -325,41 +447,43 @@ fn run_with_source<S: DataSourcer<Item = String>>(
             exit_with_code(1, &format!("[ERROR] failed to flush persistent child stdin: {}", e));
         }
 
-        let elapsed = start.elapsed();
-        let elapsed_ns = elapsed.as_nanos();
-        let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
-        accumulative_elapsed += elapsed.as_secs_f64();
         println!("[Input  ] {}", joined_input);
-        let suppress_empty_output = output_reader(&mut *collect_response, &mut stdout_lines);
-        if !suppress_empty_output.is_empty() {
-            println!("[Output ]\n{}", suppress_empty_output);
+
+        // Bound the response read by the tighter of the per-step latency budget
+        // and the remaining accumulative budget, enforced inside the channel
+        // read so a hung monitor can't block the driver indefinitely.
+        let deadline = read_deadline(start, maximum_latency_ms, accumulative_time_secs, accumulative_elapsed);
+
+        let mut timed_out = false;
+        let response = {
+            let mut lines = output.lines(deadline.map(|(at, _)| at), &mut timed_out);
+            output_reader(&mut *collect_response, &mut lines)
+        };
+        let elapsed = start.elapsed();
+
+        if timed_out {
+            let _ = child.kill();
+            report_timeout(
+                deadline.expect("a timeout implies a deadline was set").1,
+                elapsed,
+                accumulative_elapsed + elapsed.as_secs_f64(),
+                input_count,
+                maximum_latency_ms,
+                accumulative_time_secs,
+            );
+        }
+
+        // A channel close that wasn't a timeout means the monitor exited mid-run.
+        if let Ok(Some(status)) = child.try_wait() {
+            exit_with_code(1, &format!("[ERROR] persistent child exited unexpectedly: {}", status));
+        }
+
+        accumulative_elapsed += elapsed.as_secs_f64();
+        if !response.is_empty() {
+            println!("[Output ]\n{}", response);
         }
         println!("[Processed] {}", input_count);
-        println!("[Elapsed] {} ns\n", elapsed_ns);
-
-        if let Some(max_ms) = maximum_latency_ms {
-            if elapsed_ms > max_ms {
-                println!("[Accumulative Elapsed] {:.6} s", accumulative_elapsed);
-                println!("[Total Count] {}", input_count);
-                println!("[Error] maximum latency exceeded");
-                exit_with_code(250, &format!(
-                    "Fatal: maximum latency exceeded: {:.3} ms > {:.3} ms",
-                    elapsed_ms, max_ms
-                ));
-            }
-        }
-
-        if let Some(max_accumulative_secs) = accumulative_time_secs {
-            if accumulative_elapsed > max_accumulative_secs {
-                println!("[Accumulative Elapsed] {:.6} s", accumulative_elapsed);
-                println!("[Total Count] {}", input_count);
-                println!("[Error] accumulative latency exceeded");
-                exit_with_code(200, &format!(
-                    "Fatal: accumulative latency exceeded: {:.6} s > {:.6} s",
-                    accumulative_elapsed, max_accumulative_secs
-                ));
-            }
-        }
+        println!("[Elapsed] {} ns\n", elapsed.as_nanos());
     }
 
     println!("[Accumulative Elapsed] {:.6} s", accumulative_elapsed);
