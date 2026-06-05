@@ -506,6 +506,10 @@ fn main() {
         BatchingMethod::Numbers(parse_input_aggregation(cfg.input_aggregation_number.as_deref()))
     };
 
+    if cfg.mode == "real-time" && cfg.timestamp_units.is_none() {
+        exit_with_code(1, "[ERROR] --timestamp-units is required when --mode real-time is set");
+    }
+
     let batch_delimiter_raw = cfg.batch_delimiter.unwrap_or("#".to_string());
     let batch_delimiter = batch_delimiter_raw.as_str();
 
