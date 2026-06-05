@@ -121,22 +121,38 @@ fn sleep_until(next_due: Instant) {
     if next_due > now { sleep(next_due - now); }
 }
 
-fn pace_before_send(mode: &str, timestamp_units: Option<&str>, previous_timestamp: &mut Option<usize>, current_timestamp: Option<usize>) {
-    if mode != "real-time" { return; }
-
-    let Some(current) = current_timestamp else { return; };
-
-    if let (Some(previous), Some(unit_name)) = (*previous_timestamp, timestamp_units) {
-        let current_dur = timestamp_to_duration(current, unit_name);
-        let previous_dur = timestamp_to_duration(previous, unit_name);
-        if current_dur > previous_dur {
-            sleep_until(Instant::now() + (current_dur - previous_dur));
-        }
-        *previous_timestamp = Some(previous.max(current));
+/// Paces input against an absolute wall-clock schedule anchored to the first
+/// timestamped event, so each event is sent at `base + (ts - ts0)` rather than
+/// sleeping a relative gap from "now". This keeps per-step processing time from
+/// accumulating as drift: a slow step is absorbed by the next event's slot
+/// instead of pushing the whole schedule later.
+///
+/// `anchor` holds the schedule origin `(base_instant, ts0_duration)`, lazily set
+/// on the first timestamped event. In `accelerated` mode, or until a timestamp
+/// and units are both known, this is a no-op.
+fn pace_before_send(
+    mode: &str,
+    timestamp_units: Option<&str>,
+    anchor: &mut Option<(Instant, Duration)>,
+    current_timestamp: Option<usize>,
+) {
+    if mode != "real-time" {
         return;
     }
 
-    *previous_timestamp = Some(current);
+    let (Some(current), Some(unit_name)) = (current_timestamp, timestamp_units) else {
+        return;
+    };
+    let current_dur = timestamp_to_duration(current, unit_name);
+
+    match *anchor {
+        // First timestamped event defines the origin and is sent immediately.
+        None => *anchor = Some((Instant::now(), current_dur)),
+        // Sleep until this event's absolute slot. `saturating_sub` makes an
+        // out-of-order (earlier) timestamp resolve to a past instant, i.e. send
+        // now, rather than underflowing.
+        Some((base, first_dur)) => sleep_until(base + current_dur.saturating_sub(first_dur)),
+    }
 }
 
 fn resolve_timestamp_extractor(format: &str) -> fn(&str) -> Option<usize> {
@@ -422,7 +438,7 @@ fn run_with_source<S: DataSourcer<Item = String>>(
     let mut stdin = child.stdin.take().expect("[ERROR] Child stdin not piped");
     let output = OutputChannel::spawn(child.stdout.take().expect("[ERROR] Child stdout not piped"));
     let mut accumulative_elapsed = 0.0_f64;
-    let mut previous_timestamp: Option<usize> = None;
+    let mut pace_anchor: Option<(Instant, Duration)> = None;
     let mut input_count = 0usize;
     let output_reader = resolve_output_reader(output_collection_mode);
     let mut next_batch = resolve_batcher(batch_method);
@@ -436,7 +452,7 @@ fn run_with_source<S: DataSourcer<Item = String>>(
     while let Some(batch) = next_batch(&mut src) {
         let joined_input = batch.join(batch_delimiter);
         let to_write = format_input_line(latency_marker, &joined_input);
-        pace_before_send(mode, timestamp_units, &mut previous_timestamp, extract_timestamp(&batch[0]));
+        pace_before_send(mode, timestamp_units, &mut pace_anchor, extract_timestamp(&batch[0]));
 
         let start = Instant::now();
         if let Err(e) = stdin.write_all(to_write.as_bytes()) {
@@ -553,5 +569,56 @@ fn main() {
         _ => {
             exit_with_code(1, &format!("[ERROR] unknown data_source_type: {}", cfg.data_source_type));
         }
+    }
+}
+
+#[cfg(test)]
+mod pacing_tests {
+    use super::pace_before_send;
+    use std::thread::sleep;
+    use std::time::{Duration, Instant};
+
+    /// Absolute scheduling must absorb per-step processing: events at 0/200/400 ms
+    /// with 80 ms of work between them should still finish ~400 ms after the
+    /// anchor (the timestamp span), not ~560 ms as relative gap-sleeping would.
+    #[test]
+    fn absolute_schedule_absorbs_processing_delay() {
+        let units = Some("milliseconds");
+        let mut anchor: Option<(Instant, Duration)> = None;
+
+        let start = Instant::now();
+        pace_before_send("real-time", units, &mut anchor, Some(0)); // anchor, no sleep
+        sleep(Duration::from_millis(80));
+        pace_before_send("real-time", units, &mut anchor, Some(200));
+        sleep(Duration::from_millis(80));
+        pace_before_send("real-time", units, &mut anchor, Some(400));
+        let elapsed = start.elapsed();
+
+        assert!(elapsed >= Duration::from_millis(390), "paced too short: {:?}", elapsed);
+        assert!(elapsed < Duration::from_millis(480), "drifted, not absorbed: {:?}", elapsed);
+    }
+
+    /// An out-of-order timestamp below the anchor must not panic or oversleep; it
+    /// resolves to a past slot and sends immediately.
+    #[test]
+    fn out_of_order_timestamp_sends_immediately() {
+        let units = Some("milliseconds");
+        let mut anchor: Option<(Instant, Duration)> = None;
+
+        pace_before_send("real-time", units, &mut anchor, Some(500)); // anchor at 500
+        let start = Instant::now();
+        pace_before_send("real-time", units, &mut anchor, Some(100)); // earlier -> now
+        assert!(start.elapsed() < Duration::from_millis(20));
+    }
+
+    /// Accelerated mode never sleeps.
+    #[test]
+    fn accelerated_mode_does_not_sleep() {
+        let mut anchor: Option<(Instant, Duration)> = None;
+        let start = Instant::now();
+        for ts in [0usize, 1000, 5000] {
+            pace_before_send("accelerated", Some("seconds"), &mut anchor, Some(ts));
+        }
+        assert!(start.elapsed() < Duration::from_millis(50));
     }
 }
