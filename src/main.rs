@@ -449,6 +449,11 @@ fn run_with_source<S: DataSourcer<Item = String>>(
         let _ = send_line(&mut stdin, &mut lines, warm, &mut *collect_response);
     }
 
+    // Wall-clock span of the replay (after warm-up), including pacing sleeps.
+    // Unlike `accumulative_elapsed` (compute only), this reflects real-time
+    // pacing: in `--mode real-time` it should track the trace's timestamp span.
+    let run_start = Instant::now();
+
     while let Some(batch) = next_batch(&mut src) {
         let joined_input = batch.join(batch_delimiter);
         let to_write = format_input_line(latency_marker, &joined_input);
@@ -499,10 +504,16 @@ fn run_with_source<S: DataSourcer<Item = String>>(
             println!("[Output ]\n{}", response);
         }
         println!("[Processed] {}", input_count);
+        // Measured wall-clock position of this step within the replay: the send
+        // instant (after the pacing sleep) relative to run_start. Under real-time
+        // pacing it tracks the event's timestamp offset; it drifts past it when
+        // the monitor can't keep up, exposing lag directly.
+        println!("[Wall Offset] {} ns", start.duration_since(run_start).as_nanos());
         println!("[Elapsed] {} ns\n", elapsed.as_nanos());
     }
 
     println!("[Accumulative Elapsed] {:.6} s", accumulative_elapsed);
+    println!("[Wall Clock] {:.6} s", run_start.elapsed().as_secs_f64());
     println!("[Total Count] {}", input_count);
 
     drop(stdin);
