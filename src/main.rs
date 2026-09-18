@@ -1,19 +1,26 @@
 mod data_sources;
 mod timestamp_extraction;
 mod response_collection;
+mod processor_chain;
 
 use clap::Parser;
 use std::io::{BufRead, Write};
-use std::process::{ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use crate::data_sources::data_file_source::DataFileSource;
 use crate::data_sources::data_script_source::DataScriptSource;
 use crate::data_sources::data_source_trait::DataSourcer;
-use crate::response_collection::{resolve_response_collector, ResponseCollection};
+use crate::processor_chain::{spawn_chain, spawn_control_readers, ChainState, Ev, ProcessorChain};
+use crate::response_collection::{resolve_output_mode, resolve_response_collector, response_delimiter, ResponseCollection, ResponseTracker};
 use crate::timestamp_extraction::extract_timestamp_csv;
 use crate::timestamp_extraction::extract_timestamp_log;
+
+/// Protocol version of the driver's stdout log format. Version 2 adds the
+/// processor chain: [Delivered]/[Held]/[Origins k]/[Stage k Stats]/[Total
+/// Delivered] lines and quiescence-based round closure.
+pub const DRIVER_PROTOCOL: u32 = 2;
 
 
 #[derive(Parser, Debug)]
@@ -86,6 +93,12 @@ struct Config {
     /// r: a pattern to concatenate inputs
     #[arg(long)]
     batch_delimiter: Option<String>,
+
+    /// Stream processor command inserted between driver and tool; repeatable,
+    /// applied in order (driver > p0 > p1 > ... > tool). Each command must
+    /// emit `#mfctl consumed=<n> released=<m>` on stderr after every input line.
+    #[arg(long = "processor")]
+    processor: Vec<String>,
 }
 
 enum BatchingMethod {
@@ -520,12 +533,255 @@ fn run_with_source<S: DataSourcer<Item = String>>(
     let _ = child.wait();
 }
 
+enum RecvOutcome {
+    Event(Ev),
+    TimedOut,
+    Disconnected,
+}
+
+fn recv_event(rx: &Receiver<Ev>, deadline: Option<Instant>) -> RecvOutcome {
+    match deadline {
+        None => match rx.recv() {
+            Ok(ev) => RecvOutcome::Event(ev),
+            Err(_) => RecvOutcome::Disconnected,
+        },
+        Some(deadline) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(remaining) {
+                Ok(ev) => RecvOutcome::Event(ev),
+                Err(RecvTimeoutError::Timeout) => RecvOutcome::TimedOut,
+                Err(RecvTimeoutError::Disconnected) => RecvOutcome::Disconnected,
+            }
+        }
+    }
+}
+
+/// Waits until the chain is quiescent for `fed` inputs: every stage consumed
+/// its upstream, and the tool answered every delivered line. A round whose
+/// input is withheld by a buffering stage closes here on counters alone; a
+/// release makes `delivered` jump and this keeps reading until the tool's
+/// burst is fully collected. In the EOF phase it additionally waits for each
+/// stage's stats (or its exit), and a channel disconnect is a normal end.
+fn wait_for_quiescence(
+    rx: &Receiver<Ev>,
+    state: &mut ChainState,
+    tracker: &mut ResponseTracker,
+    fed: u64,
+    deadline: Option<(Instant, Budget)>,
+    chain: &mut ProcessorChain,
+    tool: &mut Child,
+    input_count: usize,
+    accumulative_elapsed: f64,
+    maximum_latency_ms: Option<f64>,
+    accumulative_time_secs: Option<f64>,
+    start: Instant,
+    eof_phase: bool,
+) {
+    loop {
+        if state.quiescent(fed, tracker.responses)
+            && (!eof_phase || state.all_stats() || state.eof.iter().all(|e| *e))
+        {
+            return;
+        }
+        match recv_event(rx, deadline.map(|(at, _)| at)) {
+            RecvOutcome::Event(ev) => match ev {
+                Ev::ToolLine(Ok(line)) => tracker.on_line(&line),
+                Ev::ToolLine(Err(e)) => {
+                    exit_with_code(1, &format!("[ERROR] error reading response from persistent child: {}", e))
+                }
+                Ev::Ctl { stage, consumed, released, dropped, origins } => {
+                    state.consumed[stage] = consumed;
+                    state.released[stage] = released;
+                    state.dropped[stage] = dropped;
+                    if let Some(origins) = origins {
+                        let csv: Vec<String> = origins.iter().map(|x| x.to_string()).collect();
+                        println!("[Origins {}] {}", stage, csv.join(","));
+                    }
+                }
+                Ev::Stats { stage, json } => state.stats[stage] = Some(json),
+                Ev::StageEof { stage } => {
+                    state.eof[stage] = true;
+                    if !eof_phase {
+                        chain.kill_all();
+                        let _ = tool.kill();
+                        exit_with_code(1, &format!("[ERROR] processor {} exited unexpectedly", stage));
+                    }
+                }
+            },
+            RecvOutcome::TimedOut => {
+                chain.kill_all();
+                let _ = tool.kill();
+                let elapsed = start.elapsed();
+                report_timeout(
+                    deadline.expect("a timeout implies a deadline was set").1,
+                    elapsed,
+                    accumulative_elapsed + elapsed.as_secs_f64(),
+                    input_count,
+                    maximum_latency_ms,
+                    accumulative_time_secs,
+                );
+            }
+            RecvOutcome::Disconnected => {
+                if eof_phase {
+                    return;
+                }
+                exit_with_code(1, "[ERROR] event channels closed unexpectedly (tool or processor died)");
+            }
+        }
+    }
+}
+
+fn run_with_chain<S: DataSourcer<Item = String>>(
+    mut src: S,
+    binary_path: &str,
+    binary_args: &[String],
+    maximum_latency_ms: Option<f64>,
+    accumulative_time_secs: Option<f64>,
+    mode: &str,
+    timestamp_units: Option<&str>,
+    extract_timestamp: fn(&str) -> Option<usize>,
+    batch_method: BatchingMethod,
+    batch_delimiter: &str,
+    output_collection_mode: &str,
+    response_mode: Option<&str>,
+    processors: &[String],
+) {
+    if !src.start() {
+        exit_with_code(1, "[ERROR] data source failed to start");
+    }
+
+    let (mut chain, mut chain_stdin, last_stdout) = spawn_chain(processors);
+    let mut tool = match Command::new(binary_path)
+        .args(binary_args)
+        .stdin(Stdio::from(last_stdout))
+        .stdout(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            chain.kill_all();
+            exit_with_code(1, &format!("[ERROR] failed to spawn persistent {}: {}", binary_path, e));
+        }
+    };
+
+    let (tx, rx) = mpsc::channel::<Ev>();
+    {
+        let tool_stdout = tool.stdout.take().expect("[ERROR] Child stdout not piped");
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(tool_stdout).lines() {
+                if tx.send(Ev::ToolLine(line)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    spawn_control_readers(&mut chain, &tx);
+    drop(tx);
+
+    let mut tracker = ResponseTracker::new(
+        response_delimiter(response_mode),
+        resolve_output_mode(output_collection_mode),
+    );
+    let mut state = ChainState::new(processors.len());
+    let mut accumulative_elapsed = 0.0_f64;
+    let mut pace_anchor: Option<(Instant, Duration)> = None;
+    let mut input_count = 0usize;
+    let mut fed: u64 = 0;
+    let mut next_batch = resolve_batcher(batch_method);
+    let run_start = Instant::now();
+
+    while let Some(batch) = next_batch(&mut src) {
+        let joined_input = batch.join(batch_delimiter);
+        pace_before_send(mode, timestamp_units, &mut pace_anchor, extract_timestamp(&batch[0]));
+
+        let start = Instant::now();
+        let mut to_write = joined_input.clone();
+        if !to_write.ends_with('\n') {
+            to_write.push('\n');
+        }
+        if let Err(e) = chain_stdin.write_all(to_write.as_bytes()) {
+            exit_with_code(1, &format!("[ERROR] failed to write to processor chain stdin: {}", e));
+        }
+        if let Err(e) = chain_stdin.flush() {
+            exit_with_code(1, &format!("[ERROR] failed to flush processor chain stdin: {}", e));
+        }
+        fed += 1;
+        input_count += batch.len();
+        println!("[Input  ] {}", joined_input);
+
+        let deadline = read_deadline(start, maximum_latency_ms, accumulative_time_secs, accumulative_elapsed);
+        wait_for_quiescence(
+            &rx, &mut state, &mut tracker, fed, deadline, &mut chain, &mut tool,
+            input_count, accumulative_elapsed, maximum_latency_ms, accumulative_time_secs,
+            start, false,
+        );
+
+        if let Ok(Some(status)) = tool.try_wait() {
+            chain.kill_all();
+            exit_with_code(1, &format!("[ERROR] persistent child exited unexpectedly: {}", status));
+        }
+
+        let elapsed = start.elapsed();
+        accumulative_elapsed += elapsed.as_secs_f64();
+        let outs = tracker.drain();
+        if !outs.is_empty() {
+            println!("[Output ]\n{}", outs.join("\n"));
+        }
+        println!("[Processed] {}", input_count);
+        println!("[Delivered] {}", state.delivered());
+        let held = state.held();
+        if held > 0 {
+            println!("[Held] {}", held);
+        }
+        println!("[Wall Offset] {} ns", start.duration_since(run_start).as_nanos());
+        println!("[Elapsed] {} ns\n", elapsed.as_nanos());
+    }
+
+    // Closing the chain's stdin cascades flush() through every stage, so held
+    // lines drain and the tool sees EOF after the final burst.
+    drop(chain_stdin);
+    let eof_start = Instant::now();
+    let deadline = read_deadline(eof_start, maximum_latency_ms, accumulative_time_secs, accumulative_elapsed);
+    wait_for_quiescence(
+        &rx, &mut state, &mut tracker, fed, deadline, &mut chain, &mut tool,
+        input_count, accumulative_elapsed, maximum_latency_ms, accumulative_time_secs,
+        eof_start, true,
+    );
+    let elapsed = eof_start.elapsed();
+    accumulative_elapsed += elapsed.as_secs_f64();
+    let outs = tracker.drain();
+    if !outs.is_empty() {
+        println!("[Output ]\n{}", outs.join("\n"));
+        println!("[Processed] {}", input_count);
+        println!("[Delivered] {}", state.delivered());
+        println!("[Wall Offset] {} ns", eof_start.duration_since(run_start).as_nanos());
+        println!("[Elapsed] {} ns\n", elapsed.as_nanos());
+    }
+    for (stage, stats) in state.stats.iter().enumerate() {
+        if let Some(json) = stats {
+            println!("[Stage {} Stats] {}", stage, json);
+        }
+    }
+
+    println!("[Accumulative Elapsed] {:.6} s", accumulative_elapsed);
+    println!("[Wall Clock] {:.6} s", run_start.elapsed().as_secs_f64());
+    println!("[Total Count] {}", input_count);
+    println!("[Total Delivered] {}", state.delivered());
+
+    let _ = tool.wait();
+    for child in chain.children.iter_mut() {
+        let _ = child.wait();
+    }
+}
+
 fn main() {
     let cfg = Config::parse();
 
+    println!("[Driver Protocol] {}", DRIVER_PROTOCOL);
+
     let binary_path = format!("{}/{}", cfg.binary_location.trim_end_matches('/'), cfg.binary_name);
     let extract_timestamp = resolve_timestamp_extractor(&cfg.format);
-    let collect_response = resolve_response_collector(cfg.response_mode.as_deref());
 
     let batch_method = if cfg.input_aggregation_pattern.is_some() {
         BatchingMethod::Pattern(cfg.input_aggregation_pattern.unwrap())
@@ -539,6 +795,59 @@ fn main() {
 
     let batch_delimiter_raw = cfg.batch_delimiter.unwrap_or("#".to_string());
     let batch_delimiter = batch_delimiter_raw.as_str();
+
+    if !cfg.processor.is_empty() {
+        // The marker and warm-up would enter the chain as data lines (a sorter
+        // would buffer or choke on them), so they are incompatible by design.
+        if cfg.latency_marker.as_deref().is_some_and(|m| !m.is_empty()) {
+            exit_with_code(1, "[ERROR] --latency-marker is not supported together with --processor");
+        }
+        if cfg.warm_up_input.is_some() {
+            exit_with_code(1, "[ERROR] --warm-up-input is not supported together with --processor");
+        }
+        match cfg.data_source_type.as_str() {
+            "file" => {
+                run_with_chain(
+                    DataFileSource::new(cfg.data_source),
+                    &binary_path,
+                    &cfg.binary_args,
+                    cfg.maximum_latency,
+                    cfg.accumulative_time,
+                    &cfg.mode,
+                    cfg.timestamp_units.as_deref(),
+                    extract_timestamp,
+                    batch_method,
+                    batch_delimiter,
+                    &cfg.output_collection_mode,
+                    cfg.response_mode.as_deref(),
+                    &cfg.processor,
+                );
+            }
+            "script" => {
+                run_with_chain(
+                    DataScriptSource::new("python3", [cfg.data_source.clone()]),
+                    &binary_path,
+                    &cfg.binary_args,
+                    cfg.maximum_latency,
+                    cfg.accumulative_time,
+                    &cfg.mode,
+                    cfg.timestamp_units.as_deref(),
+                    extract_timestamp,
+                    batch_method,
+                    batch_delimiter,
+                    &cfg.output_collection_mode,
+                    cfg.response_mode.as_deref(),
+                    &cfg.processor,
+                );
+            }
+            _ => {
+                exit_with_code(1, &format!("[ERROR] unknown data_source_type: {}", cfg.data_source_type));
+            }
+        }
+        return;
+    }
+
+    let collect_response = resolve_response_collector(cfg.response_mode.as_deref());
 
     match cfg.data_source_type.as_str() {
         "file" => {
