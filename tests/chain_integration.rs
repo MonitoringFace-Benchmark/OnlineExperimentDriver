@@ -155,3 +155,44 @@ fn chain_rejects_latency_marker_and_warmup() {
     }
     fs::remove_dir_all(&dir).ok();
 }
+
+const SILENT_TOOL: &str = "#!/bin/sh
+while IFS= read -r line; do
+  case \"$line\" in
+    *hit*) echo \"VERDICT $line\" ;;
+  esac
+done
+";
+
+#[test]
+fn chain_accounting_with_a_silent_tool() {
+    let dir = setup("chainacct", "3 a hit\n1 b\n2 c hit\nRELEASE\n5 d\n");
+    fs::write(dir.join("tool.sh"), SILENT_TOOL).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir.join("tool.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut args = base_args(&dir);
+    args.push("--processor".into());
+    args.push(format!("python3 -u {}", dir.join("sorter.py").display()));
+    args.push("--response-accounting".into());
+    args.push("chain".into());
+
+    let out = Command::new(env!("CARGO_BIN_EXE_OnlineExperimentDriver"))
+        .args(&args)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "driver failed:\n{}\n{}", stdout, String::from_utf8_lossy(&out.stderr));
+
+    // rounds close on chain counters although the tool never acknowledges
+    assert!(stdout.contains("[Held] 1"), "{}", stdout);
+    assert!(stdout.contains("[Total Delivered] 4"), "{}", stdout);
+    // the tool's selective verdicts are harvested (possibly in later rounds)
+    assert!(stdout.contains("VERDICT 2 c hit"), "{}", stdout);
+    assert!(stdout.contains("VERDICT 3 a hit"), "{}", stdout);
+    assert!(!stdout.contains("VERDICT 1 b"), "{}", stdout);
+
+    fs::remove_dir_all(&dir).ok();
+}

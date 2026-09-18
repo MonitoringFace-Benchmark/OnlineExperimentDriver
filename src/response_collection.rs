@@ -195,6 +195,7 @@ pub fn resolve_output_mode(output_collection_mode: &str) -> OutputMode {
 pub struct ResponseTracker {
     delimiter: String,
     mode: OutputMode,
+    raw: bool,
     current: Vec<String>,
     pending_after: bool,
     pub responses: u64,
@@ -206,6 +207,7 @@ impl ResponseTracker {
         ResponseTracker {
             delimiter,
             mode,
+            raw: false,
             current: Vec::new(),
             pending_after: false,
             responses: 0,
@@ -213,8 +215,23 @@ impl ResponseTracker {
         }
     }
 
+    /// Chain-accounting harvesting: every non-empty tool line is its own
+    /// completed response, no delimiter protocol. Used when the tool gives
+    /// no per-line acknowledgment (e.g. MonPoly is silent on empty
+    /// time-points), so round closure runs on chain counters alone.
+    pub fn new_raw() -> Self {
+        let mut tracker = Self::new(String::new(), OutputMode::BeforeDelimiter);
+        tracker.raw = true;
+        tracker
+    }
+
     pub fn on_line(&mut self, line: &str) {
         if line.trim().is_empty() {
+            return;
+        }
+        if self.raw {
+            self.responses += 1;
+            self.completed.push(line.to_string());
             return;
         }
         let is_delim = contains_delimiter(line, &self.delimiter);

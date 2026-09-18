@@ -99,6 +99,13 @@ struct Config {
     /// emit `#mfctl consumed=<n> released=<m>` on stderr after every input line.
     #[arg(long = "processor")]
     processor: Vec<String>,
+
+    /// Round-closure accounting with --processor: "lockstep" (default) expects
+    /// one tool response per delivered line; "chain" closes rounds on the
+    /// chain counters alone and harvests tool output as it arrives, for tools
+    /// without a per-line acknowledgment.
+    #[arg(long, value_parser = ["lockstep", "chain"], default_value = "lockstep")]
+    response_accounting: String,
 }
 
 enum BatchingMethod {
@@ -576,9 +583,11 @@ fn wait_for_quiescence(
     accumulative_time_secs: Option<f64>,
     start: Instant,
     eof_phase: bool,
+    chain_accounting: bool,
 ) {
     loop {
-        if state.quiescent(fed, tracker.responses)
+        let responses = if chain_accounting { state.delivered() } else { tracker.responses };
+        if state.quiescent(fed, responses)
             && (!eof_phase || state.all_stats() || state.eof.iter().all(|e| *e))
         {
             return;
@@ -631,6 +640,30 @@ fn wait_for_quiescence(
     }
 }
 
+/// Harvest whatever is already queued without blocking: tool lines into the
+/// tracker, counter and stats updates into the chain state. Used in chain
+/// accounting, where a round may close before the tool has spoken.
+fn drain_pending(rx: &Receiver<Ev>, state: &mut ChainState, tracker: &mut ResponseTracker) {
+    loop {
+        match rx.recv_timeout(Duration::ZERO) {
+            Ok(Ev::ToolLine(Ok(line))) => tracker.on_line(&line),
+            Ok(Ev::ToolLine(Err(_))) => return,
+            Ok(Ev::Ctl { stage, consumed, released, dropped, origins }) => {
+                state.consumed[stage] = consumed;
+                state.released[stage] = released;
+                state.dropped[stage] = dropped;
+                if let Some(origins) = origins {
+                    let csv: Vec<String> = origins.iter().map(|x| x.to_string()).collect();
+                    println!("[Origins {}] {}", stage, csv.join(","));
+                }
+            }
+            Ok(Ev::Stats { stage, json }) => state.stats[stage] = Some(json),
+            Ok(Ev::StageEof { stage }) => state.eof[stage] = true,
+            Err(_) => return,
+        }
+    }
+}
+
 fn run_with_chain<S: DataSourcer<Item = String>>(
     mut src: S,
     binary_path: &str,
@@ -645,6 +678,7 @@ fn run_with_chain<S: DataSourcer<Item = String>>(
     output_collection_mode: &str,
     response_mode: Option<&str>,
     processors: &[String],
+    chain_accounting: bool,
 ) {
     if !src.start() {
         exit_with_code(1, "[ERROR] data source failed to start");
@@ -679,10 +713,14 @@ fn run_with_chain<S: DataSourcer<Item = String>>(
     spawn_control_readers(&mut chain, &tx);
     drop(tx);
 
-    let mut tracker = ResponseTracker::new(
-        response_delimiter(response_mode),
-        resolve_output_mode(output_collection_mode),
-    );
+    let mut tracker = if chain_accounting {
+        ResponseTracker::new_raw()
+    } else {
+        ResponseTracker::new(
+            response_delimiter(response_mode),
+            resolve_output_mode(output_collection_mode),
+        )
+    };
     let mut state = ChainState::new(processors.len());
     let mut accumulative_elapsed = 0.0_f64;
     let mut pace_anchor: Option<(Instant, Duration)> = None;
@@ -714,8 +752,11 @@ fn run_with_chain<S: DataSourcer<Item = String>>(
         wait_for_quiescence(
             &rx, &mut state, &mut tracker, fed, deadline, &mut chain, &mut tool,
             input_count, accumulative_elapsed, maximum_latency_ms, accumulative_time_secs,
-            start, false,
+            start, false, chain_accounting,
         );
+        if chain_accounting {
+            drain_pending(&rx, &mut state, &mut tracker);
+        }
 
         if let Ok(Some(status)) = tool.try_wait() {
             chain.kill_all();
@@ -746,8 +787,31 @@ fn run_with_chain<S: DataSourcer<Item = String>>(
     wait_for_quiescence(
         &rx, &mut state, &mut tracker, fed, deadline, &mut chain, &mut tool,
         input_count, accumulative_elapsed, maximum_latency_ms, accumulative_time_secs,
-        eof_start, true,
+        eof_start, true, chain_accounting,
     );
+    if chain_accounting {
+        // the round loop never waited on the tool, so block here for its tail:
+        // the tool exits on stdin EOF and the channel disconnect ends the loop
+        loop {
+            let outcome = recv_event(&rx, deadline.map(|(at, _)| at));
+            match outcome {
+                RecvOutcome::Event(Ev::ToolLine(Ok(line))) => tracker.on_line(&line),
+                RecvOutcome::Event(Ev::Stats { stage, json }) => state.stats[stage] = Some(json),
+                RecvOutcome::Event(_) => {}
+                RecvOutcome::TimedOut => {
+                    chain.kill_all();
+                    let _ = tool.kill();
+                    let elapsed = eof_start.elapsed();
+                    report_timeout(
+                        deadline.expect("a timeout implies a deadline was set").1,
+                        elapsed, accumulative_elapsed + elapsed.as_secs_f64(), input_count,
+                        maximum_latency_ms, accumulative_time_secs,
+                    );
+                }
+                RecvOutcome::Disconnected => break,
+            }
+        }
+    }
     let elapsed = eof_start.elapsed();
     accumulative_elapsed += elapsed.as_secs_f64();
     let outs = tracker.drain();
@@ -821,6 +885,7 @@ fn main() {
                     &cfg.output_collection_mode,
                     cfg.response_mode.as_deref(),
                     &cfg.processor,
+                    cfg.response_accounting == "chain",
                 );
             }
             "script" => {
@@ -838,6 +903,7 @@ fn main() {
                     &cfg.output_collection_mode,
                     cfg.response_mode.as_deref(),
                     &cfg.processor,
+                    cfg.response_accounting == "chain",
                 );
             }
             _ => {
