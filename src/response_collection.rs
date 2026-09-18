@@ -264,6 +264,16 @@ impl ResponseTracker {
     pub fn drain(&mut self) -> Vec<String> {
         self.completed.drain(..).filter(|s| !s.is_empty()).collect()
     }
+
+    /// Completes whatever is buffered without a closing delimiter: the tool's
+    /// EOF tail never gets one, and would otherwise be dropped.
+    pub fn flush_current(&mut self) {
+        if !self.current.is_empty() {
+            self.responses += 1;
+            self.completed.push(self.current.join("\n"));
+            self.current.clear();
+        }
+    }
 }
 
 #[cfg(test)]

@@ -532,11 +532,28 @@ fn run_with_source<S: DataSourcer<Item = String>>(
         println!("[Elapsed] {} ns\n", elapsed.as_nanos());
     }
 
+    // Read the tool's tail: verdicts emitted while it shuts down after stdin
+    // EOF arrive after the last per-round read and were previously dropped.
+    drop(stdin);
+    let tail_deadline = read_deadline(Instant::now(), maximum_latency_ms, accumulative_time_secs, accumulative_elapsed);
+    let mut tail_timed_out = false;
+    let tail: Vec<String> = {
+        let lines = output.lines(tail_deadline.map(|(at, _)| at), &mut tail_timed_out);
+        lines.filter_map(|l| l.ok()).filter(|l| !l.trim().is_empty()).collect()
+    };
+    if tail_timed_out {
+        let _ = child.kill();
+        eprintln!("[WARN] tool did not exit after EOF within the budget; tail truncated");
+    }
+    if !tail.is_empty() {
+        println!("[Output ]\n{}", tail.join("\n"));
+        println!("[Processed] {}\n", input_count);
+    }
+
     println!("[Accumulative Elapsed] {:.6} s", accumulative_elapsed);
     println!("[Wall Clock] {:.6} s", run_start.elapsed().as_secs_f64());
     println!("[Total Count] {}", input_count);
 
-    drop(stdin);
     let _ = child.wait();
 }
 
@@ -789,9 +806,11 @@ fn run_with_chain<S: DataSourcer<Item = String>>(
         input_count, accumulative_elapsed, maximum_latency_ms, accumulative_time_secs,
         eof_start, true, chain_accounting,
     );
-    if chain_accounting {
-        // the round loop never waited on the tool, so block here for its tail:
-        // the tool exits on stdin EOF and the channel disconnect ends the loop
+    {
+        // block for the tool's tail regardless of accounting: verdicts that a
+        // monitor emits while shutting down after stdin EOF arrive after its
+        // final acknowledgment, and the quiescence wait alone would drop them.
+        // The tool exits on stdin EOF and the channel disconnect ends the loop.
         loop {
             let outcome = recv_event(&rx, deadline.map(|(at, _)| at));
             match outcome {
@@ -812,6 +831,7 @@ fn run_with_chain<S: DataSourcer<Item = String>>(
             }
         }
     }
+    tracker.flush_current();
     let elapsed = eof_start.elapsed();
     accumulative_elapsed += elapsed.as_secs_f64();
     let outs = tracker.drain();

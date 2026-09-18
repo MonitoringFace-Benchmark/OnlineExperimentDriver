@@ -196,3 +196,38 @@ fn chain_accounting_with_a_silent_tool() {
 
     fs::remove_dir_all(&dir).ok();
 }
+
+const TAIL_TOOL: &str = "#!/bin/sh
+while IFS= read -r line; do
+  echo \"OUT $line\"
+  echo \"event count\"
+done
+echo \"TAIL VERDICT\"
+";
+
+#[test]
+fn eof_tail_is_captured_on_both_paths() {
+    for chain in [false, true] {
+        let dir = setup(if chain { "tailchain" } else { "taillegacy" }, "3 a\n1 b\n2 c\nRELEASE\n");
+        fs::write(dir.join("tool.sh"), TAIL_TOOL).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir.join("tool.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut args = base_args(&dir);
+        if chain {
+            args.push("--processor".into());
+            args.push(format!("python3 -u {}", dir.join("sorter.py").display()));
+        }
+        let out = Command::new(env!("CARGO_BIN_EXE_OnlineExperimentDriver"))
+            .args(&args)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "chain={}: driver failed:\n{}\n{}", chain, stdout, String::from_utf8_lossy(&out.stderr));
+        assert!(stdout.contains("TAIL VERDICT"),
+            "chain={}: post-EOF tool output was dropped:\n{}", chain, stdout);
+        fs::remove_dir_all(&dir).ok();
+    }
+}
