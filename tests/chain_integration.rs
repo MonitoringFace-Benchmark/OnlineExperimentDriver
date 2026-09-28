@@ -234,8 +234,10 @@ fn eof_tail_is_captured_on_both_paths() {
 
 const MONPOLY_VERBOSE: &str = r##"
 import sys
+import time
 
-patched = len(sys.argv) > 1
+patched = "patched" in sys.argv[1:]
+slow = "slow" in sys.argv[1:]
 print("The analyzed formula is:")
 print("  p(x) AND EVENTUALLY[0,3) q(x)")
 stamps = []
@@ -247,6 +249,8 @@ def step(k, closing_ts):
     # the step's own results stay buffered until the next marker
     global decided
     print(f"At time point {k}:", flush=True)
+    if slow:
+        time.sleep(0.05)
     while decided < len(stamps) and (closing_ts is None or stamps[decided] + 3 <= closing_ts):
         print(f'@{stamps[decided]} (time point {decided}): (("v{decided}"))')
         decided += 1
@@ -262,9 +266,8 @@ step(len(stamps), None)
 sys.stdout.flush()
 "##;
 
-fn run_process_step(dir: &std::path::Path, patched: bool, with_processor: bool) -> (bool, String, String) {
-    let wrapper = format!("#!/bin/sh\nexec python3 -u {} {}\n",
-                          dir.join("monpoly.py").display(), if patched { "patched" } else { "" });
+fn run_process_step(dir: &std::path::Path, tool_args: &str, with_processor: bool) -> (bool, String, String) {
+    let wrapper = format!("#!/bin/sh\nexec python3 -u {} {}\n", dir.join("monpoly.py").display(), tool_args);
     fs::write(dir.join("monpoly.sh"), wrapper).unwrap();
     #[cfg(unix)]
     {
@@ -296,8 +299,8 @@ fn process_step_credits_each_step_to_its_own_round() {
     let dir = setup("process-step", "@0 a;\n@1 b;\n@2 c;\n@6 d;\n");
     fs::write(dir.join("monpoly.py"), MONPOLY_VERBOSE).unwrap();
 
-    for patched in [false, true] {
-        let (ok, stdout, stderr) = run_process_step(&dir, patched, false);
+    for tool_args in ["", "patched"] {
+        let (ok, stdout, stderr) = run_process_step(&dir, tool_args, false);
         assert!(ok, "driver failed:\n{}\n{}", stdout, stderr);
         for input in ["@0 a;", "@1 b;", "@2 c;"] {
             assert!(!round_of(&stdout, input).contains("[Output ]"), "{} decided nothing:\n{}", input, stdout);
@@ -321,9 +324,27 @@ fn process_step_credits_each_step_to_its_own_round() {
 fn process_step_is_rejected_behind_processors() {
     let dir = setup("process-step-chain", "@0 a;\n");
     fs::write(dir.join("monpoly.py"), MONPOLY_VERBOSE).unwrap();
-    let (ok, stdout, stderr) = run_process_step(&dir, false, true);
+    let (ok, stdout, stderr) = run_process_step(&dir, "", true);
     assert!(!ok, "process-step behind a processor must be refused:\n{}", stdout);
     assert!(stdout.contains("not supported together with --processor") || stderr.contains("not supported together with --processor"),
             "{}\n{}", stdout, stderr);
+    fs::remove_dir_all(&dir).ok();
+}
+
+fn footer_seconds(stdout: &str, label: &str) -> f64 {
+    let line = stdout.lines().find(|l| l.starts_with(label)).unwrap_or_else(|| panic!("{} missing:\n{}", label, stdout));
+    line[label.len()..].trim().trim_end_matches('s').trim().parse().unwrap()
+}
+
+#[test]
+fn process_step_counts_each_step_once() {
+    let dir = setup("process-step-time", "@0 a;\n@1 b;\n@2 c;\n@6 d;\n");
+    fs::write(dir.join("monpoly.py"), MONPOLY_VERBOSE).unwrap();
+    let (ok, stdout, stderr) = run_process_step(&dir, "slow", false);
+    assert!(ok, "driver failed:\n{}\n{}", stdout, stderr);
+    let busy = footer_seconds(&stdout, "[Accumulative Elapsed]");
+    let wall = footer_seconds(&stdout, "[Wall Clock]");
+    assert!(busy >= 0.15, "four 50 ms steps were not measured: {} s\n{}", busy, stdout);
+    assert!(busy <= wall, "steps overlap: {} s busy in {} s wall clock\n{}", busy, wall, stdout);
     fs::remove_dir_all(&dir).ok();
 }

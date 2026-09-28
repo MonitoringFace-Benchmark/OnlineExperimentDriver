@@ -531,14 +531,16 @@ fn run_with_source<S: DataSourcer<Item = String>>(
         }
 
         if defer {
-            // The previous step ended when this read did; its busy time runs
-            // from its own send, less the pacing sleep before this send.
+            // A step runs from its own marker (the tool has read its line) to
+            // the next marker, less the pacing sleep before the next send, so
+            // consecutive steps never overlap.
+            let marker = Instant::now();
             if let Some(prev) = pending.take() {
-                let busy = prev.start.elapsed().saturating_sub(slept);
+                let busy = marker.duration_since(prev.marker).saturating_sub(slept);
                 accumulative_elapsed += busy.as_secs_f64();
                 print_round(Some(&prev.input), &response, prev.processed, prev.start.duration_since(run_start), busy);
             }
-            pending = Some(PendingRound { input: joined_input, processed: input_count, start });
+            pending = Some(PendingRound { input: joined_input, processed: input_count, start, marker });
         } else {
             accumulative_elapsed += elapsed.as_secs_f64();
             print_round(None, &response, input_count, start.duration_since(run_start), elapsed);
@@ -576,7 +578,7 @@ fn run_with_source<S: DataSourcer<Item = String>>(
         eprintln!("[WARN] tool did not exit after EOF within the budget; tail truncated");
     }
     if let Some(prev) = pending.take() {
-        let busy = last_step_end.unwrap_or_else(Instant::now).duration_since(prev.start);
+        let busy = last_step_end.unwrap_or_else(Instant::now).duration_since(prev.marker);
         accumulative_elapsed += busy.as_secs_f64();
         print_round(Some(&prev.input), &last_step.join("\n"), prev.processed, prev.start.duration_since(run_start), busy);
     }
@@ -598,6 +600,7 @@ struct PendingRound {
     input: String,
     processed: usize,
     start: Instant,
+    marker: Instant,
 }
 
 fn print_round(input: Option<&str>, response: &str, processed: usize, wall_offset: Duration, elapsed: Duration) {
