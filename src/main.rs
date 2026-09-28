@@ -13,7 +13,7 @@ use crate::data_sources::data_file_source::DataFileSource;
 use crate::data_sources::data_script_source::DataScriptSource;
 use crate::data_sources::data_source_trait::DataSourcer;
 use crate::processor_chain::{spawn_chain, spawn_control_readers, ChainState, Ev, ProcessorChain};
-use crate::response_collection::{resolve_output_mode, resolve_response_collector, response_delimiter, ResponseCollection, ResponseTracker};
+use crate::response_collection::{resolve_output_mode, resolve_response_collector, ResponseCollection, ResponseTracker};
 use crate::timestamp_extraction::extract_timestamp_csv;
 use crate::timestamp_extraction::extract_timestamp_log;
 
@@ -54,8 +54,11 @@ struct Config {
     #[arg(long, value_parser = ["csv", "log"])]
     format: String,
 
-    /// Response collection mode for the child stdout
-    #[arg(long, value_parser = ["event-count", "current-timepoint"])]
+    /// Response collection mode for the child stdout. `process-step` is for
+    /// MonPoly with -verbose: a response is every line of one input step,
+    /// from `At time point k:` to `Process step` (the collection position
+    /// does not apply).
+    #[arg(long, value_parser = ["event-count", "current-timepoint", "process-step"])]
     response_mode: Option<String>,
 
     /// Output collection position relative to the response delimiter
@@ -539,7 +542,10 @@ fn run_with_source<S: DataSourcer<Item = String>>(
     let mut tail_timed_out = false;
     let tail: Vec<String> = {
         let lines = output.lines(tail_deadline.map(|(at, _)| at), &mut tail_timed_out);
-        lines.filter_map(|l| l.ok()).filter(|l| !l.trim().is_empty()).collect()
+        lines
+            .filter_map(|l| l.ok())
+            .filter(|l| !l.trim().is_empty() && !collect_response.is_marker(l))
+            .collect()
     };
     if tail_timed_out {
         let _ = child.kill();
@@ -733,10 +739,7 @@ fn run_with_chain<S: DataSourcer<Item = String>>(
     let mut tracker = if chain_accounting {
         ResponseTracker::new_raw()
     } else {
-        ResponseTracker::new(
-            response_delimiter(response_mode),
-            resolve_output_mode(output_collection_mode),
-        )
+        ResponseTracker::for_mode(response_mode, resolve_output_mode(output_collection_mode))
     };
     let mut state = ChainState::new(processors.len());
     let mut accumulative_elapsed = 0.0_f64;

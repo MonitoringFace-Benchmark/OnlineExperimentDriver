@@ -231,3 +231,83 @@ fn eof_tail_is_captured_on_both_paths() {
         fs::remove_dir_all(&dir).ok();
     }
 }
+
+const MONPOLY_VERBOSE: &str = r##"
+import sys
+
+print("The analyzed formula is:", flush=True)
+print("  p(x) AND EVENTUALLY[0,3) q(x)", flush=True)
+stamps = []
+decided = 0
+
+
+def step(k, closing_ts):
+    global decided
+    print(f"At time point {k}:")
+    while decided < len(stamps) and (closing_ts is None or stamps[decided] + 3 <= closing_ts):
+        print(f'@{stamps[decided]} (time point {decided}): (("v{decided}"))')
+        decided += 1
+    print("Process step", flush=True)
+
+
+for raw in sys.stdin:
+    ts = int(raw.split()[0][1:])
+    stamps.append(ts)
+    step(len(stamps) - 1, ts)
+step(len(stamps), None)
+"##;
+
+const PASS_THROUGH: &str = r##"
+import sys
+
+n = 0
+for raw in sys.stdin:
+    n += 1
+    sys.stdout.write(raw)
+    sys.stdout.flush()
+    print(f"#mfctl consumed={n} released={n} dropped=0", file=sys.stderr, flush=True)
+print('#mfstats {}', file=sys.stderr, flush=True)
+"##;
+
+#[test]
+fn process_step_collects_every_time_point_a_step_decides() {
+    let dir = setup("process-step", "@0 a;\n@1 b;\n@2 c;\n@6 d;\n");
+    fs::write(dir.join("monpoly.py"), MONPOLY_VERBOSE).unwrap();
+    fs::write(dir.join("pass.py"), PASS_THROUGH).unwrap();
+    fs::write(dir.join("monpoly.sh"), format!("#!/bin/sh\nexec python3 -u {}\n", dir.join("monpoly.py").display())).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir.join("monpoly.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut args = base_args(&dir);
+    for (flag, value) in [("--format", "log"), ("--response-mode", "process-step"),
+                          ("--output-collection-mode", "after-delimiter"), ("--binary-name", "monpoly.sh")] {
+        let i = args.iter().position(|a| a == flag).unwrap();
+        args[i + 1] = value.into();
+    }
+    let with_chain: Vec<String> = args.iter().cloned()
+        .chain(["--processor".to_string(), format!("python3 -u {}", dir.join("pass.py").display())])
+        .collect();
+
+    for run_args in [args.clone(), with_chain] {
+        let out = Command::new(env!("CARGO_BIN_EXE_OnlineExperimentDriver"))
+            .args(&run_args)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "driver failed:\n{}\n{}", stdout, String::from_utf8_lossy(&out.stderr));
+
+        let step = stdout.split("[Input  ] @6 d;").nth(1).expect("round of @6 missing");
+        let step = step.split("[Input  ]").next().unwrap();
+        for tp in 0..3 {
+            assert!(step.contains(&format!("(time point {}): ((\"v{}\"))", tp, tp)), "{}", stdout);
+        }
+        assert!(stdout.contains("(time point 3): ((\"v3\"))"), "EOF step lost:\n{}", stdout);
+        assert!(!stdout.contains("Process step"), "{}", stdout);
+        assert!(!stdout.contains("At time point"), "{}", stdout);
+        assert!(!stdout.contains("analyzed formula"), "{}", stdout);
+    }
+
+    fs::remove_dir_all(&dir).ok();
+}
