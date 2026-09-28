@@ -235,19 +235,23 @@ fn eof_tail_is_captured_on_both_paths() {
 const MONPOLY_VERBOSE: &str = r##"
 import sys
 
-print("The analyzed formula is:", flush=True)
-print("  p(x) AND EVENTUALLY[0,3) q(x)", flush=True)
+patched = len(sys.argv) > 1
+print("The analyzed formula is:")
+print("  p(x) AND EVENTUALLY[0,3) q(x)")
 stamps = []
 decided = 0
 
 
 def step(k, closing_ts):
+    # like upstream MonPoly: the step's opening marker is what flushes stdout,
+    # the step's own results stay buffered until the next marker
     global decided
-    print(f"At time point {k}:")
+    print(f"At time point {k}:", flush=True)
     while decided < len(stamps) and (closing_ts is None or stamps[decided] + 3 <= closing_ts):
         print(f'@{stamps[decided]} (time point {decided}): (("v{decided}"))')
         decided += 1
-    print("Process step", flush=True)
+    if patched:
+        print("Process step", flush=True)
 
 
 for raw in sys.stdin:
@@ -255,59 +259,71 @@ for raw in sys.stdin:
     stamps.append(ts)
     step(len(stamps) - 1, ts)
 step(len(stamps), None)
+sys.stdout.flush()
 "##;
 
-const PASS_THROUGH: &str = r##"
-import sys
-
-n = 0
-for raw in sys.stdin:
-    n += 1
-    sys.stdout.write(raw)
-    sys.stdout.flush()
-    print(f"#mfctl consumed={n} released={n} dropped=0", file=sys.stderr, flush=True)
-print('#mfstats {}', file=sys.stderr, flush=True)
-"##;
-
-#[test]
-fn process_step_collects_every_time_point_a_step_decides() {
-    let dir = setup("process-step", "@0 a;\n@1 b;\n@2 c;\n@6 d;\n");
-    fs::write(dir.join("monpoly.py"), MONPOLY_VERBOSE).unwrap();
-    fs::write(dir.join("pass.py"), PASS_THROUGH).unwrap();
-    fs::write(dir.join("monpoly.sh"), format!("#!/bin/sh\nexec python3 -u {}\n", dir.join("monpoly.py").display())).unwrap();
+fn run_process_step(dir: &std::path::Path, patched: bool, with_processor: bool) -> (bool, String, String) {
+    let wrapper = format!("#!/bin/sh\nexec python3 -u {} {}\n",
+                          dir.join("monpoly.py").display(), if patched { "patched" } else { "" });
+    fs::write(dir.join("monpoly.sh"), wrapper).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(dir.join("monpoly.sh"), fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let mut args = base_args(&dir);
+    let mut args = base_args(dir);
     for (flag, value) in [("--format", "log"), ("--response-mode", "process-step"),
                           ("--output-collection-mode", "after-delimiter"), ("--binary-name", "monpoly.sh")] {
         let i = args.iter().position(|a| a == flag).unwrap();
         args[i + 1] = value.into();
     }
-    let with_chain: Vec<String> = args.iter().cloned()
-        .chain(["--processor".to_string(), format!("python3 -u {}", dir.join("pass.py").display())])
-        .collect();
+    if with_processor {
+        args.push("--processor".into());
+        args.push(format!("python3 -u {}", dir.join("sorter.py").display()));
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_OnlineExperimentDriver")).args(&args).output().unwrap();
+    (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned(),
+     String::from_utf8_lossy(&out.stderr).into_owned())
+}
 
-    for run_args in [args.clone(), with_chain] {
-        let out = Command::new(env!("CARGO_BIN_EXE_OnlineExperimentDriver"))
-            .args(&run_args)
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(out.status.success(), "driver failed:\n{}\n{}", stdout, String::from_utf8_lossy(&out.stderr));
+fn round_of<'a>(stdout: &'a str, input: &str) -> &'a str {
+    let round = stdout.split(&format!("[Input  ] {}", input)).nth(1).unwrap_or_else(|| panic!("round {} missing", input));
+    round.split("\n\n").next().unwrap()
+}
 
-        let step = stdout.split("[Input  ] @6 d;").nth(1).expect("round of @6 missing");
-        let step = step.split("[Input  ]").next().unwrap();
+#[test]
+fn process_step_credits_each_step_to_its_own_round() {
+    let dir = setup("process-step", "@0 a;\n@1 b;\n@2 c;\n@6 d;\n");
+    fs::write(dir.join("monpoly.py"), MONPOLY_VERBOSE).unwrap();
+
+    for patched in [false, true] {
+        let (ok, stdout, stderr) = run_process_step(&dir, patched, false);
+        assert!(ok, "driver failed:\n{}\n{}", stdout, stderr);
+        for input in ["@0 a;", "@1 b;", "@2 c;"] {
+            assert!(!round_of(&stdout, input).contains("[Output ]"), "{} decided nothing:\n{}", input, stdout);
+        }
+        let step = round_of(&stdout, "@6 d;");
         for tp in 0..3 {
             assert!(step.contains(&format!("(time point {}): ((\"v{}\"))", tp, tp)), "{}", stdout);
         }
-        assert!(stdout.contains("(time point 3): ((\"v3\"))"), "EOF step lost:\n{}", stdout);
-        assert!(!stdout.contains("Process step"), "{}", stdout);
-        assert!(!stdout.contains("At time point"), "{}", stdout);
+        assert!(!step.contains("(time point 3)"), "EOF flush credited to the last round:\n{}", stdout);
+        let tail = stdout.split("[Elapsed]").last().unwrap();
+        assert!(tail.contains("(time point 3): ((\"v3\"))"), "EOF step lost:\n{}", stdout);
+        assert!(!stdout.contains("Process step") && !stdout.contains("At time point"), "{}", stdout);
         assert!(!stdout.contains("analyzed formula"), "{}", stdout);
+        assert_eq!(stdout.matches("[Input  ]").count(), 4, "{}", stdout);
     }
 
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn process_step_is_rejected_behind_processors() {
+    let dir = setup("process-step-chain", "@0 a;\n");
+    fs::write(dir.join("monpoly.py"), MONPOLY_VERBOSE).unwrap();
+    let (ok, stdout, stderr) = run_process_step(&dir, false, true);
+    assert!(!ok, "process-step behind a processor must be refused:\n{}", stdout);
+    assert!(stdout.contains("not supported together with --processor") || stderr.contains("not supported together with --processor"),
+            "{}\n{}", stdout, stderr);
     fs::remove_dir_all(&dir).ok();
 }

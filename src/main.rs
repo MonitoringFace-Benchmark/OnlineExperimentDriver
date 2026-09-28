@@ -13,7 +13,7 @@ use crate::data_sources::data_file_source::DataFileSource;
 use crate::data_sources::data_script_source::DataScriptSource;
 use crate::data_sources::data_source_trait::DataSourcer;
 use crate::processor_chain::{spawn_chain, spawn_control_readers, ChainState, Ev, ProcessorChain};
-use crate::response_collection::{resolve_output_mode, resolve_response_collector, ResponseCollection, ResponseTracker};
+use crate::response_collection::{resolve_output_mode, resolve_response_collector, response_delimiter, ResponseCollection, ResponseTracker};
 use crate::timestamp_extraction::extract_timestamp_csv;
 use crate::timestamp_extraction::extract_timestamp_log;
 
@@ -476,11 +476,17 @@ fn run_with_source<S: DataSourcer<Item = String>>(
     // Unlike `accumulative_elapsed` (compute only), this reflects real-time
     // pacing: in `--mode real-time` it should track the trace's timestamp span.
     let run_start = Instant::now();
+    // A deferring collector's read returns the previous step's output, so
+    // each round is printed once the next round has been read.
+    let defer = collect_response.defers_to_next_step();
+    let mut pending: Option<PendingRound> = None;
 
     while let Some(batch) = next_batch(&mut src) {
         let joined_input = batch.join(batch_delimiter);
         let to_write = format_input_line(latency_marker, &joined_input);
+        let pace_start = Instant::now();
         pace_before_send(mode, timestamp_units, &mut pace_anchor, extract_timestamp(&batch[0]));
+        let slept = pace_start.elapsed();
 
         let start = Instant::now();
         if let Err(e) = stdin.write_all(to_write.as_bytes()) {
@@ -491,7 +497,9 @@ fn run_with_source<S: DataSourcer<Item = String>>(
             exit_with_code(1, &format!("[ERROR] failed to flush persistent child stdin: {}", e));
         }
 
-        println!("[Input  ] {}", joined_input);
+        if !defer {
+            println!("[Input  ] {}", joined_input);
+        }
 
         // Bound the response read by the tighter of the per-step latency budget
         // and the remaining accumulative budget, enforced inside the channel
@@ -522,34 +530,55 @@ fn run_with_source<S: DataSourcer<Item = String>>(
             exit_with_code(1, &format!("[ERROR] persistent child exited unexpectedly: {}", status));
         }
 
-        accumulative_elapsed += elapsed.as_secs_f64();
-        if !response.is_empty() {
-            println!("[Output ]\n{}", response);
+        if defer {
+            // The previous step ended when this read did; its busy time runs
+            // from its own send, less the pacing sleep before this send.
+            if let Some(prev) = pending.take() {
+                let busy = prev.start.elapsed().saturating_sub(slept);
+                accumulative_elapsed += busy.as_secs_f64();
+                print_round(Some(&prev.input), &response, prev.processed, prev.start.duration_since(run_start), busy);
+            }
+            pending = Some(PendingRound { input: joined_input, processed: input_count, start });
+        } else {
+            accumulative_elapsed += elapsed.as_secs_f64();
+            print_round(None, &response, input_count, start.duration_since(run_start), elapsed);
         }
-        println!("[Processed] {}", input_count);
-        // Measured wall-clock position of this step within the replay: the send
-        // instant (after the pacing sleep) relative to run_start. Under real-time
-        // pacing it tracks the event's timestamp offset; it drifts past it when
-        // the monitor can't keep up, exposing lag directly.
-        println!("[Wall Offset] {} ns", start.duration_since(run_start).as_nanos());
-        println!("[Elapsed] {} ns\n", elapsed.as_nanos());
     }
 
     // Read the tool's tail: verdicts emitted while it shuts down after stdin
     // EOF arrive after the last per-round read and were previously dropped.
+    // A deferred last round ends at the tool's end-of-input step marker: lines
+    // before it are that round's output, lines after it the final flush.
     drop(stdin);
     let tail_deadline = read_deadline(Instant::now(), maximum_latency_ms, accumulative_time_secs, accumulative_elapsed);
     let mut tail_timed_out = false;
-    let tail: Vec<String> = {
-        let lines = output.lines(tail_deadline.map(|(at, _)| at), &mut tail_timed_out);
-        lines
-            .filter_map(|l| l.ok())
-            .filter(|l| !l.trim().is_empty() && !collect_response.is_marker(l))
-            .collect()
-    };
+    let mut last_step: Vec<String> = Vec::new();
+    let mut last_step_end: Option<Instant> = None;
+    let mut tail: Vec<String> = Vec::new();
+    for line in output.lines(tail_deadline.map(|(at, _)| at), &mut tail_timed_out).filter_map(|l| l.ok()) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if pending.is_some() && last_step_end.is_none() {
+            if collect_response.opens_step(&line) {
+                last_step_end = Some(Instant::now());
+            } else if !collect_response.is_marker(&line) {
+                last_step.push(line);
+            }
+            continue;
+        }
+        if !collect_response.is_marker(&line) {
+            tail.push(line);
+        }
+    }
     if tail_timed_out {
         let _ = child.kill();
         eprintln!("[WARN] tool did not exit after EOF within the budget; tail truncated");
+    }
+    if let Some(prev) = pending.take() {
+        let busy = last_step_end.unwrap_or_else(Instant::now).duration_since(prev.start);
+        accumulative_elapsed += busy.as_secs_f64();
+        print_round(Some(&prev.input), &last_step.join("\n"), prev.processed, prev.start.duration_since(run_start), busy);
     }
     if !tail.is_empty() {
         println!("[Output ]\n{}", tail.join("\n"));
@@ -561,6 +590,30 @@ fn run_with_source<S: DataSourcer<Item = String>>(
     println!("[Total Count] {}", input_count);
 
     let _ = child.wait();
+}
+
+/// A round whose output is only known once the next round has been read
+/// (see ResponseCollection::defers_to_next_step).
+struct PendingRound {
+    input: String,
+    processed: usize,
+    start: Instant,
+}
+
+fn print_round(input: Option<&str>, response: &str, processed: usize, wall_offset: Duration, elapsed: Duration) {
+    if let Some(input) = input {
+        println!("[Input  ] {}", input);
+    }
+    if !response.is_empty() {
+        println!("[Output ]\n{}", response);
+    }
+    println!("[Processed] {}", processed);
+    // Measured wall-clock position of this step within the replay: the send
+    // instant (after the pacing sleep) relative to run_start. Under real-time
+    // pacing it tracks the event's timestamp offset; it drifts past it when
+    // the monitor can't keep up, exposing lag directly.
+    println!("[Wall Offset] {} ns", wall_offset.as_nanos());
+    println!("[Elapsed] {} ns\n", elapsed.as_nanos());
 }
 
 enum RecvOutcome {
@@ -739,7 +792,10 @@ fn run_with_chain<S: DataSourcer<Item = String>>(
     let mut tracker = if chain_accounting {
         ResponseTracker::new_raw()
     } else {
-        ResponseTracker::for_mode(response_mode, resolve_output_mode(output_collection_mode))
+        ResponseTracker::new(
+            response_delimiter(response_mode),
+            resolve_output_mode(output_collection_mode),
+        )
     };
     let mut state = ChainState::new(processors.len());
     let mut accumulative_elapsed = 0.0_f64;
@@ -891,6 +947,11 @@ fn main() {
         }
         if cfg.warm_up_input.is_some() {
             exit_with_code(1, "[ERROR] --warm-up-input is not supported together with --processor");
+        }
+        // Rounds and tool steps do not align one to one behind a buffering
+        // stage, so a step's output cannot be credited to its round there.
+        if cfg.response_mode.as_deref() == Some("process-step") {
+            exit_with_code(1, "[ERROR] --response-mode process-step is not supported together with --processor");
         }
         match cfg.data_source_type.as_str() {
             "file" => {

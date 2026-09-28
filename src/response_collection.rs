@@ -20,6 +20,20 @@ pub trait ResponseCollection {
     fn is_marker(&self, _line: &str) -> bool {
         false
     }
+
+    /// True when a round's read returns the output of the PREVIOUS input
+    /// step: the tool only marks where a step starts, so a step's output is
+    /// complete once the next step's marker appears. The driver then prints
+    /// each round when the following one has been read.
+    fn defers_to_next_step(&self) -> bool {
+        false
+    }
+
+    /// The marker opening a step, which splits the EOF tail between the last
+    /// input step and the tool's end-of-input flush.
+    fn opens_step(&self, _line: &str) -> bool {
+        false
+    }
 }
 
 fn contains_delimiter(line: &str, delimiter: &str) -> bool {
@@ -162,18 +176,37 @@ impl ResponseCollection for CurrentTimepointCollection {
     }
 }
 
-/// MonPoly with `-verbose` brackets every input step: `At time point k:` opens
-/// it and `Process step` closes it. In between come the result lines of every
-/// time-point the step decided, which is more than one whenever a future
-/// window closes for several earlier time-points at once. Only the formula
-/// header precedes the first step; at EOF MonPoly opens one more step for its
-/// final flush, so every result line lies inside a bracket.
+/// MonPoly with `-verbose` prints `At time point k:` when it reads input step
+/// k, then the result lines of every time-point step k decided (several at
+/// once whenever a future window closes for more than one earlier
+/// time-point). Nothing marks the end of a step, and the marker is what
+/// flushes stdout, so step k's output is complete exactly when marker k+1
+/// arrives. In lockstep the driver writes line k+1 only after marker k, hence
+/// everything read before marker k+1 is step k's output. Only the formula
+/// header precedes the first marker; at EOF MonPoly opens one more step for
+/// its final flush. Locally patched builds that also print `Process step`
+/// after each step are handled the same way, the extra line is dropped.
 const STEP_OPEN: &str = "at time point";
 const STEP_CLOSE: &str = "process step";
 
-fn read_step(stdout_lines: &mut dyn Iterator<Item = std::io::Result<String>>) -> String {
-    consume_lines_until(stdout_lines, STEP_OPEN);
-    read_lines_until(stdout_lines, STEP_CLOSE)
+fn read_before_next_step(stdout_lines: &mut dyn Iterator<Item = std::io::Result<String>>) -> String {
+    let mut result = Vec::new();
+    loop {
+        match stdout_lines.next() {
+            Some(Ok(line)) => {
+                if line.trim().is_empty() || contains_delimiter(&line, STEP_CLOSE) {
+                    continue;
+                }
+                if contains_delimiter(&line, STEP_OPEN) {
+                    break;
+                }
+                result.push(line);
+            }
+            Some(Err(e)) => exit_with_code(1, &format!("[ERROR] error reading response from persistent child: {}", e)),
+            None => break,
+        }
+    }
+    result.join("\n")
 }
 
 pub struct ProcessStepCollection;
@@ -183,27 +216,35 @@ impl ResponseCollection for ProcessStepCollection {
         &mut self,
         stdout_lines: &mut dyn Iterator<Item = std::io::Result<String>>,
     ) -> String {
-        read_step(stdout_lines)
+        read_before_next_step(stdout_lines)
     }
 
-    /// The step is bracketed on both sides, so the collection position
-    /// relative to a delimiter does not apply.
+    /// A step's output is bounded by the markers on both sides, so the
+    /// collection position relative to a delimiter does not apply.
     fn read_since(
         &mut self,
         stdout_lines: &mut dyn Iterator<Item = std::io::Result<String>>,
     ) -> String {
-        read_step(stdout_lines)
+        read_before_next_step(stdout_lines)
     }
 
     fn consume_until(
         &mut self,
         stdout_lines: &mut dyn Iterator<Item = std::io::Result<String>>,
     ) {
-        consume_lines_until(stdout_lines, STEP_CLOSE)
+        consume_lines_until(stdout_lines, STEP_OPEN)
     }
 
     fn is_marker(&self, line: &str) -> bool {
         contains_delimiter(line, STEP_OPEN) || contains_delimiter(line, STEP_CLOSE)
+    }
+
+    fn defers_to_next_step(&self) -> bool {
+        true
+    }
+
+    fn opens_step(&self, line: &str) -> bool {
+        contains_delimiter(line, STEP_OPEN)
     }
 }
 
@@ -220,7 +261,6 @@ pub fn response_delimiter(mode: Option<&str>) -> String {
     match mode.unwrap_or("event-count") {
         "event-count" => "event count".to_string(),
         "current-timepoint" => "At time point".to_string(),
-        "process-step" => STEP_CLOSE.to_string(),
         _ => exit_with_code(1, &format!("[ERROR] unknown response_mode: {}", mode.unwrap_or("event-count"))),
     }
 }
@@ -248,8 +288,6 @@ pub struct ResponseTracker {
     delimiter: String,
     mode: OutputMode,
     raw: bool,
-    open: Option<String>,
-    inside: bool,
     current: Vec<String>,
     pending_after: bool,
     pub responses: u64,
@@ -262,24 +300,10 @@ impl ResponseTracker {
             delimiter,
             mode,
             raw: false,
-            open: None,
-            inside: false,
             current: Vec::new(),
             pending_after: false,
             responses: 0,
             completed: Vec::new(),
-        }
-    }
-
-    /// The tracker for a response mode. `process-step` collects each bracketed
-    /// MonPoly step whole, whatever the collection position.
-    pub fn for_mode(response_mode: Option<&str>, mode: OutputMode) -> Self {
-        if response_mode == Some("process-step") {
-            let mut tracker = Self::new(STEP_CLOSE.to_string(), OutputMode::BeforeDelimiter);
-            tracker.open = Some(STEP_OPEN.to_string());
-            tracker
-        } else {
-            Self::new(response_delimiter(response_mode), mode)
         }
     }
 
@@ -300,19 +324,6 @@ impl ResponseTracker {
         if self.raw {
             self.responses += 1;
             self.completed.push(line.to_string());
-            return;
-        }
-        if let Some(open) = &self.open {
-            if contains_delimiter(line, open) {
-                self.inside = true;
-            } else if contains_delimiter(line, &self.delimiter) {
-                self.responses += 1;
-                self.completed.push(self.current.join("\n"));
-                self.current.clear();
-                self.inside = false;
-            } else if self.inside {
-                self.current.push(line.to_string());
-            }
             return;
         }
         let is_delim = contains_delimiter(line, &self.delimiter);
@@ -379,7 +390,22 @@ mod tracker_tests {
         text.lines().map(|l| Ok(l.to_string())).collect()
     }
 
-    const MONPOLY_VERBOSE: &str = "The analyzed formula is:\n\
+    // Upstream MonPoly -verbose (the bc752d37 / master format): a step only has
+    // an opening marker; its result lines follow it.
+    const MONPOLY_UPSTREAM: &str = "The analyzed formula is:\n\
+        \x20 insert(x,\"db2\",y,data)\n\
+        The sequence of free variables is: (x,y,data)\n\
+        At time point 6685:\n\
+        @1282872059 (time point 6625): ()\n\
+        At time point 6686:\n\
+        @1282872060 (time point 6626): ()\n\
+        @1282872061 (time point 6627): ()\n\
+        @1282872062 (time point 6628): ()\n\
+        @1282872063 (time point 6629): ((\"script\",\"86\",\"443377957\"))\n\
+        At time point 6687:\n";
+
+    // A locally patched build that also prints `Process step` after each step.
+    const MONPOLY_PATCHED: &str = "The analyzed formula is:\n\
         \x20 insert(x,\"db2\",y,data)\n\
         The sequence of free variables is: (x,y,data)\n\
         At time point 6685:\n\
@@ -391,47 +417,36 @@ mod tracker_tests {
         @1282872062 (time point 6628): ()\n\
         @1282872063 (time point 6629): ((\"script\",\"86\",\"443377957\"))\n\
         Process step\n\
-        At time point 6687:\n\
-        Process step\n";
+        At time point 6687:\n";
 
     #[test]
-    fn process_step_reads_every_decided_time_point_of_a_step() {
-        let mut c = ProcessStepCollection;
-        let mut it = lines(MONPOLY_VERBOSE).into_iter();
-        assert_eq!(c.read_since(&mut it), "@1282872059 (time point 6625): ()");
-        assert_eq!(
-            c.read_since(&mut it),
-            "@1282872060 (time point 6626): ()\n\
-             @1282872061 (time point 6627): ()\n\
-             @1282872062 (time point 6628): ()\n\
-             @1282872063 (time point 6629): ((\"script\",\"86\",\"443377957\"))"
-        );
-        assert_eq!(c.read_until(&mut it), "");
-        assert_eq!(c.read_until(&mut it), "");
-    }
-
-    #[test]
-    fn process_step_tracker_counts_steps_and_skips_the_header() {
-        let mut t = ResponseTracker::for_mode(Some("process-step"), OutputMode::AfterDelimiter);
-        for l in MONPOLY_VERBOSE.lines() {
-            t.on_line(l);
+    fn process_step_reads_each_step_up_to_the_next_marker() {
+        for fixture in [MONPOLY_UPSTREAM, MONPOLY_PATCHED] {
+            let mut c = ProcessStepCollection;
+            assert!(c.defers_to_next_step());
+            let mut it = lines(fixture).into_iter();
+            let header = c.read_since(&mut it);
+            assert!(header.starts_with("The analyzed formula is:"), "{}", header);
+            assert_eq!(c.read_since(&mut it), "@1282872059 (time point 6625): ()");
+            assert_eq!(
+                c.read_until(&mut it),
+                "@1282872060 (time point 6626): ()\n\
+                 @1282872061 (time point 6627): ()\n\
+                 @1282872062 (time point 6628): ()\n\
+                 @1282872063 (time point 6629): ((\"script\",\"86\",\"443377957\"))"
+            );
+            assert_eq!(c.read_until(&mut it), "");
         }
-        assert_eq!(t.responses, 3);
-        let got = t.drain();
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0], "@1282872059 (time point 6625): ()");
-        assert!(got[1].contains("(time point 6629): ((\"script\",\"86\",\"443377957\"))"));
-        assert_eq!(got[1].lines().count(), 4);
     }
 
     #[test]
     fn current_timepoint_keeps_only_one_line_per_step() {
         let mut c = CurrentTimepointCollection::new("At time point");
-        let mut it = lines(MONPOLY_VERBOSE).into_iter();
-        c.read_since(&mut it);
+        let mut it = lines(MONPOLY_UPSTREAM).into_iter();
+        assert_eq!(c.read_since(&mut it), "@1282872059 (time point 6625): ()");
         assert_eq!(c.read_since(&mut it), "@1282872060 (time point 6626): ()");
-        c.read_since(&mut it);
-        assert!(it.next().is_none());
+        assert_eq!(c.read_since(&mut it), "");
+        assert!(it.next().is_none(), "the lines of time-points 6627 to 6629 were skipped");
     }
 
     #[test]
