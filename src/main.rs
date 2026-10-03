@@ -16,6 +16,7 @@ use crate::processor_chain::{spawn_chain, spawn_control_readers, ChainState, Ev,
 use crate::response_collection::{resolve_output_mode, resolve_response_collector, response_delimiter, ResponseCollection, ResponseTracker};
 use crate::timestamp_extraction::extract_timestamp_csv;
 use crate::timestamp_extraction::extract_timestamp_log;
+use crate::timestamp_extraction::extract_timestamp_prefixed;
 
 /// Protocol version of the driver's stdout log format. Version 2 adds the
 /// processor chain: [Delivered]/[Held]/[Origins k]/[Stage k Stats]/[Total
@@ -50,9 +51,16 @@ struct Config {
     #[arg(long, value_parser = ["seconds", "milliseconds", "microseconds"])]
     timestamp_units: Option<String>,
 
-    /// Timestamp format: csv or log
-    #[arg(long, value_parser = ["csv", "log"])]
+    /// Timestamp format: csv, log, or prefixed (every line starts with
+    /// `<due>\t`, the replay time recorded for it in --timestamp-units; the
+    /// prefix paces the line and is stripped before it is sent or logged)
+    #[arg(long, value_parser = ["csv", "log", "prefixed"])]
     format: String,
+
+    /// Replay speed in real-time mode: 2.0 replays twice as fast as the
+    /// timestamps say, 0.5 half as fast
+    #[arg(long, default_value_t = 1.0)]
+    speed: f64,
 
     /// Response collection mode for the child stdout. `process-step` is for
     /// MonPoly with -verbose: a response is every line of one input step,
@@ -156,6 +164,7 @@ fn sleep_until(next_due: Instant) {
 fn pace_before_send(
     mode: &str,
     timestamp_units: Option<&str>,
+    speed: f64,
     anchor: &mut Option<(Instant, Duration)>,
     current_timestamp: Option<usize>,
 ) {
@@ -174,14 +183,28 @@ fn pace_before_send(
         // Sleep until this event's absolute slot. `saturating_sub` makes an
         // out-of-order (earlier) timestamp resolve to a past instant, i.e. send
         // now, rather than underflowing.
-        Some((base, first_dur)) => sleep_until(base + current_dur.saturating_sub(first_dur)),
+        Some((base, first_dur)) => sleep_until(base + scale(current_dur.saturating_sub(first_dur), speed)),
     }
+}
+
+/// A schedule offset at replay speed `speed`.
+fn scale(offset: Duration, speed: f64) -> Duration {
+    if speed == 1.0 { offset } else { offset.div_f64(speed) }
+}
+
+/// Drops the due-time prefixes of a `prefixed` batch once it has been paced.
+fn strip_dues(batch: Vec<String>, prefixed: bool) -> Vec<String> {
+    if !prefixed {
+        return batch;
+    }
+    batch.into_iter().map(|line| extract_timestamp_prefixed::strip(&line).to_string()).collect()
 }
 
 fn resolve_timestamp_extractor(format: &str) -> fn(&str) -> Option<usize> {
     match format {
         "csv" => extract_timestamp_csv::extract_ts,
         "log" => extract_timestamp_log::extract_ts,
+        "prefixed" => extract_timestamp_prefixed::extract_ts,
         _ => exit_with_code(1, &format!("[ERROR] unknown format: {}", format)),
     }
 }
@@ -414,7 +437,7 @@ fn resolve_batcher<S: DataSourcer<Item = String>>(
             Box::new(move |src: &mut S| {
                 let mut batch = vec![src.iterate()?];
                 
-                while !batch.last().unwrap().starts_with(&pattern) {
+                while !extract_timestamp_prefixed::strip(batch.last().unwrap()).starts_with(&pattern) {
                     match src.iterate() {
                         Some(next_input) => batch.push(next_input),
                         None => break,
@@ -436,6 +459,8 @@ fn run_with_source<S: DataSourcer<Item = String>>(
     accumulative_time_secs: Option<f64>,
     mode: &str,
     timestamp_units: Option<&str>,
+    speed: f64,
+    prefixed: bool,
     extract_timestamp: fn(&str) -> Option<usize>,
     batch_method: BatchingMethod,
     batch_delimiter: &str,
@@ -482,10 +507,12 @@ fn run_with_source<S: DataSourcer<Item = String>>(
     let mut pending: Option<PendingRound> = None;
 
     while let Some(batch) = next_batch(&mut src) {
+        let due = extract_timestamp(&batch[0]);
+        let batch = strip_dues(batch, prefixed);
         let joined_input = batch.join(batch_delimiter);
         let to_write = format_input_line(latency_marker, &joined_input);
         let pace_start = Instant::now();
-        pace_before_send(mode, timestamp_units, &mut pace_anchor, extract_timestamp(&batch[0]));
+        pace_before_send(mode, timestamp_units, speed, &mut pace_anchor, due);
         let slept = pace_start.elapsed();
 
         let start = Instant::now();
@@ -751,6 +778,8 @@ fn run_with_chain<S: DataSourcer<Item = String>>(
     accumulative_time_secs: Option<f64>,
     mode: &str,
     timestamp_units: Option<&str>,
+    speed: f64,
+    prefixed: bool,
     extract_timestamp: fn(&str) -> Option<usize>,
     batch_method: BatchingMethod,
     batch_delimiter: &str,
@@ -809,8 +838,10 @@ fn run_with_chain<S: DataSourcer<Item = String>>(
     let run_start = Instant::now();
 
     while let Some(batch) = next_batch(&mut src) {
+        let due = extract_timestamp(&batch[0]);
+        let batch = strip_dues(batch, prefixed);
         let joined_input = batch.join(batch_delimiter);
-        pace_before_send(mode, timestamp_units, &mut pace_anchor, extract_timestamp(&batch[0]));
+        pace_before_send(mode, timestamp_units, speed, &mut pace_anchor, due);
 
         let start = Instant::now();
         let mut to_write = joined_input.clone();
@@ -935,6 +966,11 @@ fn main() {
         BatchingMethod::Numbers(parse_input_aggregation(cfg.input_aggregation_number.as_deref()))
     };
 
+    if !(cfg.speed.is_finite() && cfg.speed > 0.0) {
+        exit_with_code(1, &format!("[ERROR] --speed must be a positive number, got {}", cfg.speed));
+    }
+    let prefixed = cfg.format == "prefixed";
+
     if cfg.mode == "real-time" && cfg.timestamp_units.is_none() {
         exit_with_code(1, "[ERROR] --timestamp-units is required when --mode real-time is set");
     }
@@ -966,6 +1002,8 @@ fn main() {
                     cfg.accumulative_time,
                     &cfg.mode,
                     cfg.timestamp_units.as_deref(),
+                    cfg.speed,
+                    prefixed,
                     extract_timestamp,
                     batch_method,
                     batch_delimiter,
@@ -984,6 +1022,8 @@ fn main() {
                     cfg.accumulative_time,
                     &cfg.mode,
                     cfg.timestamp_units.as_deref(),
+                    cfg.speed,
+                    prefixed,
                     extract_timestamp,
                     batch_method,
                     batch_delimiter,
@@ -1014,6 +1054,8 @@ fn main() {
                 cfg.accumulative_time,
                 &cfg.mode,
                 cfg.timestamp_units.as_deref(),
+                cfg.speed,
+                prefixed,
                 extract_timestamp,
                 batch_method,
                 batch_delimiter,
@@ -1032,6 +1074,8 @@ fn main() {
                 cfg.accumulative_time,
                 &cfg.mode,
                 cfg.timestamp_units.as_deref(),
+                cfg.speed,
+                prefixed,
                 extract_timestamp,
                 batch_method,
                 batch_delimiter,
@@ -1060,11 +1104,11 @@ mod pacing_tests {
         let mut anchor: Option<(Instant, Duration)> = None;
 
         let start = Instant::now();
-        pace_before_send("real-time", units, &mut anchor, Some(0)); // anchor, no sleep
+        pace_before_send("real-time", units, 1.0, &mut anchor, Some(0)); // anchor, no sleep
         sleep(Duration::from_millis(80));
-        pace_before_send("real-time", units, &mut anchor, Some(200));
+        pace_before_send("real-time", units, 1.0, &mut anchor, Some(200));
         sleep(Duration::from_millis(80));
-        pace_before_send("real-time", units, &mut anchor, Some(400));
+        pace_before_send("real-time", units, 1.0, &mut anchor, Some(400));
         let elapsed = start.elapsed();
 
         assert!(elapsed >= Duration::from_millis(390), "paced too short: {:?}", elapsed);
@@ -1078,10 +1122,24 @@ mod pacing_tests {
         let units = Some("milliseconds");
         let mut anchor: Option<(Instant, Duration)> = None;
 
-        pace_before_send("real-time", units, &mut anchor, Some(500)); // anchor at 500
+        pace_before_send("real-time", units, 1.0, &mut anchor, Some(500)); // anchor at 500
         let start = Instant::now();
-        pace_before_send("real-time", units, &mut anchor, Some(100)); // earlier -> now
+        pace_before_send("real-time", units, 1.0, &mut anchor, Some(100)); // earlier -> now
         assert!(start.elapsed() < Duration::from_millis(20));
+    }
+
+    /// Replay speed scales the schedule: timestamps 0/400 ms at speed 2.0 are
+    /// sent 200 ms apart.
+    #[test]
+    fn speed_scales_the_schedule() {
+        let units = Some("milliseconds");
+        let mut anchor: Option<(Instant, Duration)> = None;
+        let start = Instant::now();
+        pace_before_send("real-time", units, 2.0, &mut anchor, Some(0));
+        pace_before_send("real-time", units, 2.0, &mut anchor, Some(400));
+        let elapsed = start.elapsed();
+        assert!(elapsed >= Duration::from_millis(195), "paced too short: {:?}", elapsed);
+        assert!(elapsed < Duration::from_millis(300), "not scaled: {:?}", elapsed);
     }
 
     /// Accelerated mode never sleeps.
@@ -1090,7 +1148,7 @@ mod pacing_tests {
         let mut anchor: Option<(Instant, Duration)> = None;
         let start = Instant::now();
         for ts in [0usize, 1000, 5000] {
-            pace_before_send("accelerated", Some("seconds"), &mut anchor, Some(ts));
+            pace_before_send("accelerated", Some("seconds"), 1.0, &mut anchor, Some(ts));
         }
         assert!(start.elapsed() < Duration::from_millis(50));
     }

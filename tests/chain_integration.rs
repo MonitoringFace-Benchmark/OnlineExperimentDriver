@@ -348,3 +348,31 @@ fn process_step_counts_each_step_once() {
     assert!(busy <= wall, "steps overlap: {} s busy in {} s wall clock\n{}", busy, wall, stdout);
     fs::remove_dir_all(&dir).ok();
 }
+
+/// `--format prefixed`: each line's `<due>\t` prefix paces it (scaled by
+/// --speed) and is stripped, so neither the tool nor the [Input] log sees it.
+/// Dues 0/200/400 ms at speed 4 replay in about 100 ms, not 400.
+#[test]
+fn prefixed_format_paces_by_the_prefix_and_strips_it() {
+    let dir = setup("prefixed", "0\tA, tp=0, ts=0, x=1\n200\t>ELAPSED 0 @ 0<\n400\tA, tp=1, ts=1, x=2\n");
+    let mut args = base_args(&dir);
+    let mode = args.iter().position(|a| a == "--mode").unwrap();
+    args[mode + 1] = "real-time".into();
+    let format = args.iter().position(|a| a == "--format").unwrap();
+    args[format + 1] = "prefixed".into();
+    args.extend(["--timestamp-units", "milliseconds", "--speed", "4"].map(String::from));
+    let out = Command::new(env!("CARGO_BIN_EXE_OnlineExperimentDriver"))
+        .args(&args)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "driver failed:\n{}\n{}", stdout, String::from_utf8_lossy(&out.stderr));
+
+    assert!(stdout.contains("[Input  ] A, tp=0, ts=0, x=1"), "{}", stdout);
+    assert!(stdout.contains("OUT >ELAPSED 0 @ 0<"), "the claim must reach the tool unprefixed:\n{}", stdout);
+    assert!(!stdout.contains("\t"), "a due prefix leaked:\n{}", stdout);
+    let wall = footer_seconds(&stdout, "[Wall Clock]");
+    assert!((0.09..0.35).contains(&wall), "not paced at speed 4: {} s\n{}", wall, stdout);
+
+    fs::remove_dir_all(&dir).ok();
+}
