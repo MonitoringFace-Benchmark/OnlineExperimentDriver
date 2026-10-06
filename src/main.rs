@@ -2,6 +2,7 @@ mod data_sources;
 mod timestamp_extraction;
 mod response_collection;
 mod processor_chain;
+mod open_loop;
 
 use clap::Parser;
 use std::io::{BufRead, Write};
@@ -117,6 +118,16 @@ struct Config {
     /// without a per-line acknowledgment.
     #[arg(long, value_parser = ["lockstep", "chain"], default_value = "lockstep")]
     response_accounting: String,
+
+    /// Open loop: write the input on its schedule without waiting for answers,
+    /// and stamp every line the tool prints with the time it arrived
+    /// (`[Out] <ns since the start> <line>`). No per-line latency is measured;
+    /// a tool that reports its progress (TimelyMon --progress) gives each input
+    /// line's completion time. --maximum-latency bounds the wait for the tool
+    /// to exit after the end of the input. Not with --processor,
+    /// --response-mode, --latency-marker, --warm-up-input or --accumulative-time.
+    #[arg(long)]
+    open_loop: bool,
 }
 
 enum BatchingMethod {
@@ -977,6 +988,53 @@ fn main() {
 
     let batch_delimiter_raw = cfg.batch_delimiter.unwrap_or("#".to_string());
     let batch_delimiter = batch_delimiter_raw.as_str();
+
+    if cfg.open_loop {
+        // Nothing waits for a response in the open loop, so the options that
+        // shape or budget responses would be silently ignored: refuse them.
+        if !cfg.processor.is_empty()
+            || cfg.response_mode.is_some()
+            || cfg.latency_marker.is_some()
+            || cfg.warm_up_input.is_some()
+            || cfg.accumulative_time.is_some()
+        {
+            exit_with_code(
+                1,
+                "[ERROR] --open-loop does not wait for responses: --processor, --response-mode, \
+                 --latency-marker, --warm-up-input and --accumulative-time do not apply",
+            );
+        }
+        match cfg.data_source_type.as_str() {
+            "file" => open_loop::run_open_loop(
+                DataFileSource::new(cfg.data_source),
+                &binary_path,
+                &cfg.binary_args,
+                cfg.maximum_latency,
+                &cfg.mode,
+                cfg.timestamp_units.as_deref(),
+                cfg.speed,
+                prefixed,
+                extract_timestamp,
+                batch_method,
+                batch_delimiter,
+            ),
+            "script" => open_loop::run_open_loop(
+                DataScriptSource::new("python3", [cfg.data_source.clone()]),
+                &binary_path,
+                &cfg.binary_args,
+                cfg.maximum_latency,
+                &cfg.mode,
+                cfg.timestamp_units.as_deref(),
+                cfg.speed,
+                prefixed,
+                extract_timestamp,
+                batch_method,
+                batch_delimiter,
+            ),
+            _ => exit_with_code(1, &format!("[ERROR] unknown data_source_type: {}", cfg.data_source_type)),
+        }
+        return;
+    }
 
     if !cfg.processor.is_empty() {
         // The marker and warm-up would enter the chain as data lines (a sorter
