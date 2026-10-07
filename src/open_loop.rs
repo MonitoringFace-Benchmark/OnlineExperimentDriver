@@ -7,7 +7,10 @@
 //! prints `#progress N` once the input up to line N is processed) gives every
 //! input line's completion time, and every verdict line carries its own.
 //!
-//! Log lines: `[Open Loop] 1` first; `[Out] <ns> <line>` per tool line;
+//! Log lines: `[Open Loop] 1` first; `[Anchor] <due> <ns>` once the schedule is
+//! anchored (real-time mode: the first paced line's timestamp and when it was
+//! sent, so `[Out]` times convert to log time as due + (ns - anchor ns) * speed);
+//! `[Out] <ns> <line>` per tool line;
 //! `[Sent] <lines> <ns>` every SENT_EVERY lines and at the end of the input; the
 //! footer `[Total Count]`, `[Max Send Lateness] <ns> at line <n>` (how late a
 //! line entered the tool's input against its slot, e.g. because the pipe was
@@ -87,10 +90,17 @@ pub fn run_open_loop<S: DataSourcer<Item = String>>(
     let mut sent = 0usize;
     let mut max_late = Duration::ZERO;
     let mut late_at = 0usize;
+    let mut anchored = false;
     while let Some(batch) = next_batch(&mut src) {
         let due = extract_timestamp(&batch[0]);
         let batch = strip_dues(batch, prefixed);
         pace_before_send(mode, timestamp_units, speed, &mut anchor, due);
+        if !anchored {
+            if let (Some((base, _)), Some(due)) = (anchor, due) {
+                println!("[Anchor] {} {}", due, base.duration_since(run_start).as_nanos());
+                anchored = true;
+            }
+        }
         let slot = slot_of(mode, timestamp_units, speed, anchor, due);
         let mut line = batch.join(batch_delimiter);
         line.push('\n');

@@ -71,6 +71,8 @@ fn open_loop_writes_without_waiting_and_stamps_the_output() {
     // the lockstep log lines never appear
     assert!(!stdout.contains("[Input  ]"), "{}", stdout);
     assert!(!stdout.contains("[Elapsed]"), "{}", stdout);
+    // nothing is paced in accelerated mode, so there is no anchor
+    assert!(!stdout.contains("[Anchor]"), "{}", stdout);
     fs::remove_dir_all(&dir).ok();
 }
 
@@ -91,6 +93,7 @@ fn open_loop_paces_each_line_to_its_due_time() {
     assert!(ms(at("OUT b")) >= 200 && ms(at("OUT b")) < 350, "{}", stdout);
     assert!(ms(at("OUT c")) >= 400 && ms(at("OUT c")) < 550, "{}", stdout);
     assert!(stdout.contains("[Max Send Lateness] "), "{}", stdout);
+    assert!(stdout.contains("[Anchor] 0 "), "{}", stdout);
     fs::remove_dir_all(&dir).ok();
 }
 
