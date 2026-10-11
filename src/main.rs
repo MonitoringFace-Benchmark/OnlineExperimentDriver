@@ -10,7 +10,7 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
-use crate::data_sources::data_file_source::DataFileSource;
+use crate::data_sources::data_file_source::{DataFileSource, DEFAULT_READ_AHEAD_LINES};
 use crate::data_sources::data_script_source::DataScriptSource;
 use crate::data_sources::data_source_trait::DataSourcer;
 use crate::processor_chain::{spawn_chain, spawn_control_readers, ChainState, Ev, ProcessorChain};
@@ -128,6 +128,12 @@ struct Config {
     /// --response-mode, --latency-marker, --warm-up-input or --accumulative-time.
     #[arg(long)]
     open_loop: bool,
+
+    /// File input: lines a reader thread keeps buffered ahead of the sender (the file is
+    /// streamed, not loaded; a slow read is absorbed by the buffer, and the run reports on
+    /// stderr whether the sender ever found it empty).
+    #[arg(long, default_value_t = DEFAULT_READ_AHEAD_LINES)]
+    read_ahead_lines: usize,
 }
 
 enum BatchingMethod {
@@ -1006,7 +1012,7 @@ fn main() {
         }
         match cfg.data_source_type.as_str() {
             "file" => open_loop::run_open_loop(
-                DataFileSource::new(cfg.data_source),
+                DataFileSource::with_read_ahead(cfg.data_source, cfg.read_ahead_lines),
                 &binary_path,
                 &cfg.binary_args,
                 cfg.maximum_latency,
@@ -1053,7 +1059,7 @@ fn main() {
         match cfg.data_source_type.as_str() {
             "file" => {
                 run_with_chain(
-                    DataFileSource::new(cfg.data_source),
+                    DataFileSource::with_read_ahead(cfg.data_source, cfg.read_ahead_lines),
                     &binary_path,
                     &cfg.binary_args,
                     cfg.maximum_latency,
@@ -1103,7 +1109,7 @@ fn main() {
     match cfg.data_source_type.as_str() {
         "file" => {
             run_with_source(
-                DataFileSource::new(cfg.data_source),
+                DataFileSource::with_read_ahead(cfg.data_source, cfg.read_ahead_lines),
                 &binary_path,
                 &cfg.binary_args,
                 cfg.warm_up_input.as_deref(),
