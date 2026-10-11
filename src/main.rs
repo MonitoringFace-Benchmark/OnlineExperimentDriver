@@ -124,8 +124,10 @@ struct Config {
     /// (`[Out] <ns since the start> <line>`). No per-line latency is measured;
     /// a tool that reports its progress (TimelyMon --progress) gives each input
     /// line's completion time. --maximum-latency bounds the wait for the tool
-    /// to exit after the end of the input. Not with --processor,
-    /// --response-mode, --latency-marker, --warm-up-input or --accumulative-time.
+    /// to exit after the end of the input. Processors (--processor) run live
+    /// between the driver and the tool, as in lockstep. Not with
+    /// --response-mode, --response-accounting chain, --latency-marker,
+    /// --warm-up-input or --accumulative-time.
     #[arg(long)]
     open_loop: bool,
 
@@ -998,15 +1000,15 @@ fn main() {
     if cfg.open_loop {
         // Nothing waits for a response in the open loop, so the options that
         // shape or budget responses would be silently ignored: refuse them.
-        if !cfg.processor.is_empty()
-            || cfg.response_mode.is_some()
+        if cfg.response_mode.is_some()
+            || cfg.response_accounting != "lockstep"
             || cfg.latency_marker.is_some()
             || cfg.warm_up_input.is_some()
             || cfg.accumulative_time.is_some()
         {
             exit_with_code(
                 1,
-                "[ERROR] --open-loop does not wait for responses: --processor, --response-mode, \
+                "[ERROR] --open-loop does not wait for responses: --response-mode, --response-accounting, \
                  --latency-marker, --warm-up-input and --accumulative-time do not apply",
             );
         }
@@ -1023,6 +1025,7 @@ fn main() {
                 extract_timestamp,
                 batch_method,
                 batch_delimiter,
+                &cfg.processor,
             ),
             "script" => open_loop::run_open_loop(
                 DataScriptSource::new("python3", [cfg.data_source.clone()]),
@@ -1036,6 +1039,7 @@ fn main() {
                 extract_timestamp,
                 batch_method,
                 batch_delimiter,
+                &cfg.processor,
             ),
             _ => exit_with_code(1, &format!("[ERROR] unknown data_source_type: {}", cfg.data_source_type)),
         }

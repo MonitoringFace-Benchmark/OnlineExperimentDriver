@@ -7,21 +7,30 @@
 //! prints `#progress N` once the input up to line N is processed) gives every
 //! input line's completion time, and every verdict line carries its own.
 //!
+//! Stream processors (`--processor`) run live between the driver and the tool,
+//! as in lockstep: the driver writes each line into the first stage at its
+//! slot, and the tool reads what the last stage releases, when it releases it.
+//! No round is closed on their control lines here, so those are only drained;
+//! a stage's final stats and the lines the chain delivered go to the footer.
+//!
 //! Log lines: `[Open Loop] 1` first; `[Anchor] <due> <ns>` once the schedule is
 //! anchored (real-time mode: the first paced line's timestamp and when it was
 //! sent, so `[Out]` times convert to log time as due + (ns - anchor ns) * speed);
 //! `[Out] <ns> <line>` per tool line;
 //! `[Sent] <lines> <ns>` every SENT_EVERY lines and at the end of the input; the
-//! footer `[Total Count]`, `[Max Send Lateness] <ns> at line <n>` (how late a
-//! line entered the tool's input against its slot, e.g. because the pipe was
-//! full), `[Tool Exit]` and `[Wall Clock]`.
+//! footer `[Total Count]`, with processors `[Stage k Stats] <json>` per stage and
+//! `[Total Delivered]` (lines the last stage released to the tool),
+//! `[Max Send Lateness] <ns> at line <n>` (how late a line entered the input
+//! against its slot, e.g. because the pipe was full), `[Tool Exit]` and
+//! `[Wall Clock]`.
 
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
-use std::thread::sleep;
+use std::process::{Child, Command, Stdio};
+use std::thread::{sleep, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::data_sources::data_source_trait::DataSourcer;
+use crate::processor_chain::{parse_ctl, parse_stats, spawn_chain, ProcessorChain};
 use crate::{exit_with_code, pace_before_send, resolve_batcher, scale, strip_dues, timestamp_to_duration, BatchingMethod};
 
 /// The sender logs its position every this many input lines.
@@ -45,6 +54,59 @@ fn slot_of(
     Some(base + scale(timestamp_to_duration(due, units).saturating_sub(first), speed))
 }
 
+/// What a stage reported on its control channel: the lines it released so far
+/// and its final stats line.
+#[derive(Default)]
+struct StageReport {
+    released: u64,
+    stats: Option<String>,
+}
+
+/// One reader per stage stderr, so a stage never blocks on a full control
+/// pipe. Control and stats lines are kept for the footer; anything else is the
+/// stage's own diagnostics and goes to stderr, as in lockstep.
+fn drain_stage_controls(chain: &mut ProcessorChain) -> Vec<JoinHandle<StageReport>> {
+    chain
+        .children
+        .iter_mut()
+        .enumerate()
+        .map(|(stage, child)| {
+            let stderr = child.stderr.take().expect("[ERROR] processor stderr not piped");
+            std::thread::spawn(move || {
+                let mut report = StageReport::default();
+                for line in BufReader::new(stderr).lines() {
+                    let Ok(line) = line else { break };
+                    if let Some((_, released, _, _)) = parse_ctl(&line) {
+                        report.released = released;
+                    } else if let Some(json) = parse_stats(&line) {
+                        report.stats = Some(json);
+                    } else {
+                        eprintln!("[stage {}] {}", stage, line);
+                    }
+                }
+                report
+            })
+        })
+        .collect()
+}
+
+/// Waits for `child` to exit until `deadline`; `None` if it had to be killed.
+fn wait_until(child: &mut Child, deadline: Option<Instant>) -> Option<std::process::ExitStatus> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {}
+            Err(e) => exit_with_code(1, &format!("[ERROR] cannot wait for a child process: {}", e)),
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        sleep(Duration::from_millis(10));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_open_loop<S: DataSourcer<Item = String>>(
     mut src: S,
@@ -58,21 +120,39 @@ pub fn run_open_loop<S: DataSourcer<Item = String>>(
     extract_timestamp: fn(&str) -> Option<usize>,
     batch_method: BatchingMethod,
     batch_delimiter: &str,
+    processors: &[String],
 ) {
     if !src.start() {
         exit_with_code(1, "[ERROR] data source failed to start");
     }
+    // With processors the tool reads the last stage's output and the driver
+    // writes into the first stage; otherwise it writes to the tool.
+    let (mut chain, chain_stdin, tool_stdin) = if processors.is_empty() {
+        (None, None, Stdio::piped())
+    } else {
+        let (chain, chain_stdin, last_stdout) = spawn_chain(processors);
+        (Some(chain), Some(chain_stdin), Stdio::from(last_stdout))
+    };
     let mut child = match Command::new(binary_path)
         .args(binary_args)
-        .stdin(Stdio::piped())
+        .stdin(tool_stdin)
         .stdout(Stdio::piped())
         .spawn()
     {
         Ok(c) => c,
-        Err(e) => exit_with_code(1, &format!("[ERROR] failed to spawn {}: {}", binary_path, e)),
+        Err(e) => {
+            if let Some(chain) = chain.as_mut() {
+                chain.kill_all();
+            }
+            exit_with_code(1, &format!("[ERROR] failed to spawn {}: {}", binary_path, e))
+        }
     };
-    let mut stdin = child.stdin.take().expect("[ERROR] Child stdin not piped");
+    let mut stdin: Box<dyn Write> = match chain_stdin {
+        Some(chain_stdin) => Box::new(chain_stdin),
+        None => Box::new(child.stdin.take().expect("[ERROR] Child stdin not piped")),
+    };
     let stdout = child.stdout.take().expect("[ERROR] Child stdout not piped");
+    let stage_reports = chain.as_mut().map(drain_stage_controls).unwrap_or_default();
 
     println!("[Open Loop] 1");
     let run_start = Instant::now();
@@ -104,8 +184,8 @@ pub fn run_open_loop<S: DataSourcer<Item = String>>(
         let slot = slot_of(mode, timestamp_units, speed, anchor, due);
         let mut line = batch.join(batch_delimiter);
         line.push('\n');
-        // One write per line, so a line reaches the tool at its slot; when the
-        // tool is behind and the pipe is full, the write waits.
+        // One write per line, so a line reaches the tool (or the first stage)
+        // at its slot; when it is behind and the pipe is full, the write waits.
         if stdin.write_all(line.as_bytes()).is_err() {
             eprintln!("[WARN] the tool stopped reading its input after {} line(s)", sent);
             break;
@@ -123,29 +203,37 @@ pub fn run_open_loop<S: DataSourcer<Item = String>>(
             println!("[Sent] {} {}", sent, run_start.elapsed().as_nanos());
         }
     }
-    // End of input.
+    // End of input. With processors, closing the first stage's input cascades
+    // through the chain: each stage flushes what it holds and closes its
+    // output, so the tool sees the end after the final release.
     drop(stdin);
     println!("[Sent] {} {}", sent, run_start.elapsed().as_nanos());
 
     // The tool finishes on its own; --maximum-latency bounds the wait.
     let deadline = maximum_latency_ms.map(|ms| Instant::now() + Duration::from_secs_f64(ms / 1000.0));
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {}
-            Err(e) => exit_with_code(1, &format!("[ERROR] cannot wait for the tool: {}", e)),
+    let status = wait_until(&mut child, deadline);
+    if status.is_none() {
+        eprintln!("[WARN] tool did not exit after EOF within the budget; killed");
+    }
+    if let Some(chain) = chain.as_mut() {
+        for (stage, stage_child) in chain.children.iter_mut().enumerate() {
+            if wait_until(stage_child, deadline).is_none() {
+                eprintln!("[WARN] processor {} did not exit after EOF within the budget; killed", stage);
+            }
         }
-        if deadline.is_some_and(|d| Instant::now() >= d) {
-            let _ = child.kill();
-            let _ = child.wait();
-            eprintln!("[WARN] tool did not exit after EOF within the budget; killed");
-            break None;
-        }
-        sleep(Duration::from_millis(10));
-    };
+    }
     let _ = reader.join();
 
     println!("[Total Count] {}", sent);
+    if !stage_reports.is_empty() {
+        let reports: Vec<StageReport> = stage_reports.into_iter().map(|h| h.join().unwrap_or_default()).collect();
+        for (stage, report) in reports.iter().enumerate() {
+            if let Some(json) = &report.stats {
+                println!("[Stage {} Stats] {}", stage, json);
+            }
+        }
+        println!("[Total Delivered] {}", reports.last().map_or(0, |r| r.released));
+    }
     println!("[Max Send Lateness] {} ns at line {}", max_late.as_nanos(), late_at);
     match status {
         Some(s) => println!("[Tool Exit] {}", s),
